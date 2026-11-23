@@ -1,0 +1,4 @@
+dump/*
+test-scans/*
+__pycache__/*
+tools/*

@@ -267,11 +267,23 @@ Host-side codes in ShowAlert: 2 = out of memory, 0x100 = device not found, 0x400
 dialogs, 0x40000000 = cancelled. TEST UNIT READY returns good even with the cover open, so test the
 feeder with READ 8B (or REQUEST SENSE after it).
 
+## Button cancel during a sheet (verified live)
+The vendor driver polls the panel key (READ dtc 84) between 1 MB image READs, at intervals. When the key is down it stops reading and sends
+OBJECT POSITION unload `31 00 …` (eject), then in batch mode STOP BATCH `D8 00 00 00 00 00 00 00 00 00`. Both return GOOD.
+Afterwards TEST UNIT READY is clean and no sense is pending. canon_r10.py polls every 0.3 s while reading, discards the partial sheet
+and finishes the batch (`--no-button-cancel` disables this).
+
+## Other resolutions and dithered B&W (software, verified live)
+The scanner only scans at 300 or 600 dpi (base 600). `--dpi N` (50–1200) scans at 300 (N ≤ 300) or 600 and resamples after enhancement.
+Shrinking by 2× or more is done first by 2×2 box averaging (keeps thin strokes), then bilinear.
+The ratio is used as an exact fraction, so each output column phase is a strided slice; ratios whose repeat exceeds 16 pixels are refused (e.g. 299).
+An A4 side takes 0.06 s for 300→200 and 0.8 s for 600→1200, matching a reference bilinear to ±1.
+The PDF page size uses the output dpi. `--dither` replaces the bw threshold with serpentine Floyd–Steinberg error diffusion
+(~1.7 s per A4 side at 300 dpi); despeckle is skipped for dithered pages.
+
 ## TODO
 Features
-- Button cancels a sheet mid-scan (vendor polls the key during READ, `SetEzKeyAbort`); currently it only ends a batch between sheets.
 - Double-feed detection (DEFINE SCAN MODE page 0x30; sense 3/81 01 is already decoded).
-- Software resolutions other than 300/600, error-diffusion B&W.
 - Searchable PDF: not needed here (OCR is done downstream, after the PDFs are imported into Paperless-ngx).
 - Roller/pad counters (READ dtc 8C) and counter reset.
 
@@ -283,8 +295,6 @@ Quality / speed
 Usability
 - Volume auto-mount is done (finds CANON/R10 in /sys/block, mounts or remounts it read-write via udisksctl).
   Not tested: hot-plugging during a run, or two R10s attached at once (it uses the first one found).
-- retry paper detection 3 times so it doesnt error in middle of multiple pages "error: no paper in the feeder (sense 5/3a 00, command 1b) - load a sheet
-"
 
 Untested live
 - Final alignment changes (sideways and white-on-black text, non-square sheets) were checked offline only.

@@ -403,6 +403,17 @@ class R10:
     def scan(self, ids):
         self.t.execute(bytes([0x1B, 0, 0, 0, len(ids), 0]), data_out=bytes(ids))
 
+    def stop_scan(self):
+        """What the vendor driver does when the panel key is pressed mid-sheet:
+        OBJECT POSITION unload (eject the sheet), then STOP BATCH (0xD8)."""
+        for cdb in (bytes([0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0]), bytes([0xD8, 0, 0, 0, 0, 0, 0, 0, 0, 0])):
+            try:
+                self.t.execute(cdb, check=False)
+                if self.t.status:
+                    self.t.sense()
+            except ScannerError:
+                pass
+
     def object_position(self, action):
         """0 = unload/eject, 1 = load (from driver: 0x40100 >> (action*8))."""
         self.t.execute(bytes([0x31, (0x40100 >> (action * 8)) & 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]))
@@ -414,10 +425,19 @@ class R10:
         size, window, offs = q(2), q(1), q(3)
         return {"paper_length": size[3], "window": window, "offsets": offs}
 
-    def read_page(self, chunk=0x100000, log=None):
-        """READ image until CHECK CONDITION. Returns (bytes, sense tuple)."""
+    def read_page(self, chunk=0x100000, log=None, abort=None, abort_every=0.3):
+        """READ image until CHECK CONDITION. Returns (bytes, sense tuple).
+        abort: callable polled between READs (at most every abort_every s, as
+        the vendor driver polls the panel key); if it returns True the sheet is
+        stopped and ejected (stop_scan) and the sense key is -1."""
         out = bytearray()
+        next_check = time.time() + abort_every
         while True:
+            if abort and time.time() >= next_check:
+                next_check = time.time() + abort_every
+                if abort():
+                    self.stop_scan()
+                    return bytes(out), (-1, 0, 0, 0, b"")
             data = self.read(0, chunk, check=False)
             if self.t.status == 0:
                 out += data
@@ -858,6 +878,121 @@ def to_bilevel(img, w, h, threshold=170, despeckle_on=True):
     return despeckle(packed, (w + pad) // 8, h) if despeckle_on else packed
 
 
+def dither_fs(img, w, h, threshold=128):
+    """Floyd-Steinberg error diffusion (serpentine) -> 8-bit 0/255 image.
+    Pure Python: roughly 1-2 s per million pixels."""
+    out = bytearray(w * h)
+    nxt = [0] * (w + 2)                     # errors x16, index x+1
+    for y in range(h):
+        cur, nxt = nxt, [0] * (w + 2)
+        row = img[y * w:(y + 1) * w]
+        base = y * w
+        if y & 1:
+            xs, d = range(w - 1, -1, -1), -1
+        else:
+            xs, d = range(w), 1
+        for x in xs:
+            i = x + 1
+            v = row[x] + (cur[i] >> 4)
+            if v >= threshold:
+                out[base + x] = 255
+                e = v - 255
+            else:
+                e = v
+            if e:
+                cur[i + d] += e * 7
+                nxt[i - d] += e * 3
+                nxt[i] += e * 5
+                nxt[i + d] += e
+    return bytes(out)
+
+
+_RND = {}
+
+
+def _mix(a, b, wb):
+    """(a*(256-wb) + b*wb) / 256 per byte, rounded; a, b equal-length bytes.
+    16-bit lanes in one big int (max 255*256+128 fits)."""
+    if wb <= 0:
+        return bytes(a)
+    if wb >= 256:
+        return bytes(b)
+    n = len(a)
+    la = bytearray(2 * n)
+    la[1::2] = a
+    lb = bytearray(2 * n)
+    lb[1::2] = b
+    rnd = _RND.get(n)
+    if rnd is None:
+        rnd = _RND[n] = int.from_bytes(b"\0\x80" * n, "big")
+    acc = int.from_bytes(la, "big") * (256 - wb) + int.from_bytes(lb, "big") * wb + rnd
+    return acc.to_bytes(2 * n, "big")[0::2]
+
+
+def _halve(c, w, h):
+    """2x2 box average (drops an odd last row/column)."""
+    w2, h2 = w // 2, h // 2
+    if w & 1:
+        c = b"".join(c[y * w:y * w + 2 * w2] for y in range(h))
+    c = _mix(c[0::2], c[1::2], 128)                       # columns (rows stay aligned)
+    ev = b"".join(c[(2 * y) * w2:(2 * y + 1) * w2] for y in range(h2))
+    od = b"".join(c[(2 * y + 1) * w2:(2 * y + 2) * w2] for y in range(h2))
+    return _mix(ev, od, 128), w2, h2
+
+
+def resample(chans, w, h, src_dpi, dst_dpi):
+    """Scale every channel by dst_dpi/src_dpi: 2x2 box averaging while
+    shrinking by 2x or more, then bilinear (exact rational phases, so each
+    output column phase is a strided slice and the arithmetic is done on whole
+    images at once)."""
+    from fractions import Fraction
+    r = Fraction(src_dpi, dst_dpi)                          # source px per output px
+    while r >= 2:
+        out = [_halve(c, w, h) for c in chans]
+        chans, w, h = [o[0] for o in out], out[0][1], out[0][2]
+        r /= 2
+    if r == 1:
+        return chans, w, h
+    q, p = r.numerator, r.denominator                       # p outputs per q inputs
+    ow = (w * p // q) // p * p
+    oh = h * p // q
+    E = ow // p + 3                                         # padded row = E*q pixels
+    wp = E * q
+    phases = []
+    for k in range(p):
+        f = (k + 0.5) * q / p - 0.5
+        i = math.floor(f)                                   # may be -1 when enlarging
+        phases.append((k, i + 1, int(round((f - i) * 256)), len(range(k, ow, p))))
+    res = []
+    for c in chans:
+        # one replicated pixel on the left (index shift +1), replicated on the right
+        padded = b"".join(c[y * w:y * w + 1] + c[y * w:(y + 1) * w]
+                          + c[(y + 1) * w - 1:(y + 1) * w] * (wp - w - 1)
+                          for y in range(h))
+        hr = bytearray(ow * h)
+        for k, i, wb, cnt in phases:
+            # phase slices of the padded image hold exactly E samples per row;
+            # i + 1 may reach q, i.e. the next sample slot of the same phase
+            a = padded[i % q::q]
+            oa = i // q
+            b = padded[(i + 1) % q::q]
+            ob = (i + 1) // q
+            a = b"".join(a[y * E + oa:y * E + oa + cnt] for y in range(h))
+            b = b"".join(b[y * E + ob:y * E + ob + cnt] for y in range(h))
+            hr[k::p] = _mix(a, b, wb)
+        hr = bytes(hr)
+        o = bytearray(ow * oh)
+        for y in range(oh):
+            f = (y + 0.5) * q / p - 0.5
+            fi = math.floor(f)
+            wb = int(round((f - fi) * 256))
+            i = min(max(fi, 0), h - 1)
+            j = min(max(fi + 1, 0), h - 1)
+            o[y * ow:(y + 1) * ow] = _mix(hr[i * ow:(i + 1) * ow], hr[j * ow:(j + 1) * ow], wb)
+        res.append(bytes(o))
+    return res, ow, oh
+
+
 def despeckle(packed, stride, h):
     """Turn isolated black pixels (no black among the 8 neighbours) white.
     Works on whole rows as big ints (black = 1 after inverting)."""
@@ -1084,6 +1219,8 @@ def cmd_scan(r, a):
     log("caps: %s" % {k: v for k, v in caps.items() if k != "raw"})
     if a.dpi not in (300, 600):
         raise ScannerError("the R10 scans at 300 or 600 dpi")
+    if getattr(a, "out_dpi", a.dpi) != a.dpi:
+        log("output %d dpi: scanning at %d dpi and resampling" % (a.out_dpi, a.dpi))
     if a.card:                                 # the card wait comes after calibration
         a.duplex, a.button, a.wait_paper = True, False, False
     if a.button:
@@ -1200,12 +1337,20 @@ def cmd_scan(r, a):
         return
 
     jpeg_q = a.jpeg_quality if a.mode in ("color", "auto") else 0   # only colour pages use JPEG
-    sink = (PdfSink(a.out, a.dpi, jpeg_q, log) if a.out.lower().endswith(".pdf")
+    sink = (PdfSink(a.out, getattr(a, "out_dpi", a.dpi), jpeg_q, log) if a.out.lower().endswith(".pdf")
             else PngSink(a.out))
     page = 0
     try:
         while True:
-            data, (key, asc, ascq, info, raw) = r.read_page(log=log if a.verbose else None)
+            data, (key, asc, ascq, info, raw) = r.read_page(
+                log=log if a.verbose else None,
+                abort=None if a.no_button_cancel else r.button_down)
+            if key == -1:
+                while r.button_down():
+                    time.sleep(0.05)
+                log("button pressed - %s %d cancelled and ejected (not saved); finishing"
+                    % ("card" if a.card else "sheet", page))
+                break
             if data:
                 if a.keep_raw:
                     with open("%s.page%03d.raw" % (a.out.rstrip("/"), page), "wb") as f:
@@ -1490,6 +1635,9 @@ def process_sides(data, w, ids, planes, luts, a, log, paper_len=0, vbin=1):
             log("side %s: not blank (ink %.3f%%)" % (label, dark))
         if not a.no_enhance:
             chans = enhance(chans, iw, ih, a)
+        odpi = getattr(a, "out_dpi", a.dpi)
+        if odpi != a.dpi:
+            chans, iw, ih = resample(chans, iw, ih, a.dpi, odpi)
         if a.mode == "auto":
             cov = colour_coverage(chans, iw, ih, a.dpi)
             if cov < a.colour_threshold:
@@ -1498,7 +1646,11 @@ def process_sides(data, w, ids, planes, luts, a, log, paper_len=0, vbin=1):
                 continue
             log("side %s: colour (%.3f%%)" % (label, cov))
         if a.mode == "bw":
-            result.append(("A" if wid == 0 else "B", iw, ih, 0, to_bilevel(chans[0], iw, ih, a.threshold, not a.no_despeckle)))
+            if getattr(a, "dither", False):
+                bw = to_bilevel(dither_fs(chans[0], iw, ih), iw, ih, 128, False)
+            else:
+                bw = to_bilevel(chans[0], iw, ih, a.threshold, not a.no_despeckle)
+            result.append(("A" if wid == 0 else "B", iw, ih, 0, bw))
             continue
         if planes == 1:
             out = chans[0]
@@ -2209,6 +2361,8 @@ def main():
   Both: 300 dpi, both sides, one PDF (default name scan-YYYYmmdd-HHMMSS.pdf, or -o).
         Waits for the first sheet (button/Ctrl-C cancels), scans each sheet as it
         is fed, and finishes when the scanner button is pressed (Ctrl-C also saves).
+        Pressing the button while a sheet is going through stops and ejects that
+        sheet (it is not saved); the sheets before it are saved.
         Blank sides are skipped (--keep-blank to keep them).
   --default-card  ID/bank cards: colour, 300 dpi, both sides, cropped to the card.
         Push each card into the front card slot (the clear flap, front right);
@@ -2249,12 +2403,22 @@ recommended image settings (on by default for every scan, presets included):
                         "one card at a time; button or Ctrl-C finishes)")
     p.add_argument("--card-rotate", type=int, choices=[0, 90, 180, 270], default=0,
                    help="card mode: rotate each side clockwise by this many degrees")
+    p.add_argument("--no-button-cancel", action="store_true",
+                   help="don't let the scanner button cancel the sheet being scanned "
+                        "(by default a press during a sheet ejects it unsaved and finishes)")
     p.add_argument("--keep-blank", action="store_true",
                    help="presets: keep blank sides (blank-page skipping is on by default)")
     p.add_argument("--wait-paper", action="store_true",
                    help="wait for the first sheet instead of failing when the feeder is "
                         "empty (the button cancels while waiting)")
-    p.add_argument("--dpi", type=int, default=300)
+    p.add_argument("--dpi", type=int, default=300,
+                   help="output resolution, 50-1200 (default 300). The scanner itself "
+                        "scans at 300 or 600; other values are scanned at 300 (up to "
+                        "300) or 600 and resampled, e.g. 150 or 200 for smaller files")
+    p.add_argument("--dither", action="store_true",
+                   help="bw mode: error diffusion (Floyd-Steinberg) instead of a fixed "
+                        "threshold - keeps photos and shading as dot patterns. Slower "
+                        "(~2 s per A4 side at 300 dpi)")
     p.add_argument("--mode", choices=["gray", "color", "bw", "auto"], default="gray",
                    help="bw = black-and-white text mode (gray scan, 1-bit output); "
                         "auto = scan in colour, save pages without colour as gray")
@@ -2309,7 +2473,21 @@ recommended image settings (on by default for every scan, presets included):
     p.add_argument("--no-flip", action="store_true", help="keep raw line order")
     argv = sys.argv[1:]
     if any(x in ("--default-col", "--default-bw", "--default-card") for x in argv) and "scan" not in argv:
-        argv = ["scan"] + argv                    # allow: canon_r10.py --default-col
+        # allow: canon_r10.py [-v] --default-col [...]; keep global options global
+        glob, rest, i = [], [], 0
+        while i < len(argv):
+            x = argv[i]
+            if x in ("-v", "--verbose"):
+                glob.append(x)
+            elif x in ("--volume", "--timeout") and i + 1 < len(argv):
+                glob += argv[i:i + 2]
+                i += 1
+            elif x.startswith(("--volume=", "--timeout=")):
+                glob.append(x)
+            else:
+                rest.append(x)
+            i += 1
+        argv = glob + ["scan"] + rest
     a = ap.parse_args(argv)
     if a.cmd == "scan":
         if a.default_col + a.default_bw + a.default_card > 1:
@@ -2332,6 +2510,20 @@ recommended image settings (on by default for every scan, presets included):
                 a.out = os.path.join(out, stamp)
         elif a.out is None:
             a.out = "scans"
+        if not 50 <= a.dpi <= 1200:
+            ap.error("--dpi must be between 50 and 1200")
+        a.out_dpi = a.dpi
+        a.dpi = 300 if a.dpi <= 300 else 600          # what the scanner does
+        from fractions import Fraction
+        r = Fraction(a.dpi, a.out_dpi)
+        while r >= 2:
+            r /= 2
+        if r.denominator > 16:
+            ok = [d for d in range(50, 1201) if Fraction(300 if d <= 300 else 600, d).denominator <= 16
+                  or Fraction(300 if d <= 300 else 600, d) >= 2]
+            near = min(ok, key=lambda d: abs(d - a.out_dpi))
+            ap.error("--dpi %d is not supported (it can't be resampled cleanly from %d); "
+                     "try %d" % (a.out_dpi, a.dpi, near))
 
     try:
         with FileTransport(a.volume, a.timeout, a.verbose) as t:

@@ -83,6 +83,15 @@ State machine (8 lines averaged to one line, values 0–4095):
 Then a white reference (ids FE) and a dark reference (ids FF) build the shading:
 `coef = (T<<12)/(white−black)` (T = 4316 gray; 4306/4317/4349 R/G/B), `out = clamp((pix − black>>4)·coef >> 12)`.
 
+## Front-sensor shear (measured)
+Images from side A (front sensor) are slightly sheared, not just rotated: text lines come out about 0.25–0.40° more tilted
+than vertical rules and column edges on the same page (three scans: +0.25/+0.30/+0.40°). Side B shows −0.02 to −0.15°.
+Probably the front CIS is not exactly perpendicular to the feed. Straightening therefore measures both directions (projection profile
+of horizontal and of vertical structure) and shifts rows by the vertical angle and columns by the horizontal angle.
+The second angle is used only when its peak gain is ≥ 1.06 and it is within 0.6° of the first; otherwise one angle is used for both.
+Result on the problem page: residual 0.03° (text) / 0.00° (rules), and the paper-edge shadow no longer ends up inside the crop.
+Side edges that stay slightly slanted (< 0.1" end to end) are cropped at their inner point.
+
 ## Factory light-curve correction (ported)
 After the white/black references, the vendor reads 0x80000 bytes at 0x10080000 (READ BUFFER 0x3B) and runs
 `AdjustLightFix` → `CSpecialFilter::makeShadingData` → `CAdjustLight::AdjustLightCurve` →
@@ -187,6 +196,11 @@ Canon's maintenance panel item "Maximum length for paper size" (Standard 356 mm,
   sizing from max_length picks it up with no other changes. Verified live: a 15.65" leaflet scanned complete
   (it previously stopped at about 14.5" with jam 3/80 00 and paper_length −1).
 - Vendor caveats: feed long sheets straight and by hand; jam detection is delayed.
+- **Gray scans in long document mode come back stretched ~3× vertically** (nine A4 sheets: 3.02–3.05×, including the
+  lead-in overscan), presumably because the motor runs at colour speed (one exposure per line instead of three).
+  Colour scans in the same mode are normal. canon_r10.py compares lines received with the scanner's measured
+  paper_length (+ 0x1D8 overscan, + ~20 trailing lines). When the ratio is near 2, 3 or 4 (±0.3), it averages that many lines into
+  one before any other processing. Normal scans give a ratio of 1 and are untouched.
 canon_r10.py: `max-length [standard|1000|3000]`. The original block of this unit is saved in `dump/dtc8c_q01_before.bin`.
 
 ## PDF output (software)
@@ -237,7 +251,7 @@ Features
 - Button cancels a sheet mid-scan (vendor polls the key during READ, `SetEzKeyAbort`); currently it only ends a batch between sheets.
 - Double-feed detection (DEFINE SCAN MODE page 0x30; sense 3/81 01 is already decoded).
 - Software resolutions other than 300/600, error-diffusion B&W.
-- Searchable PDF (OCR; the device ships Canon's OCR component as appfile2).
+- Searchable PDF: not needed here (OCR is done downstream, after the PDFs are imported into Paperless-ngx).
 - Roller/pad counters (READ dtc 8C) and counter reset.
 
 Quality / speed
@@ -246,7 +260,10 @@ Quality / speed
 - Pure-Python processing: 600 dpi colour duplex takes about 56 s and 700 MB per sheet; optional numpy path.
 
 Usability
-- Needs the ONTOUCHLITE volume mounted read-write by hand (`udisksctl mount`); udev rule / auto-mount.
+- Volume auto-mount is done (finds CANON/R10 in /sys/block, mounts or remounts it read-write via udisksctl).
+  Not tested: hot-plugging during a run, or two R10s attached at once (it uses the first one found).
+- retry paper detection 3 times so it doesnt error in middle of multiple pages "error: no paper in the feeder (sense 5/3a 00, command 1b) - load a sheet
+"
 
 Untested live
 - Final alignment changes (sideways and white-on-black text, non-square sheets) were checked offline only.

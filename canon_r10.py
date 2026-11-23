@@ -87,21 +87,94 @@ def _align(n):
     return (n + SECTOR - 1) // SECTOR * SECTOR
 
 
-def find_volume():
-    """Return the mount point of the R10's ONTOUCHLITE volume."""
+def _mounts():
+    """[(device, mountpoint, options)] from /proc/mounts."""
+    out = []
     with open("/proc/mounts") as f:
         for line in f:
-            dev, mnt = line.split()[:2]
-            mnt = mnt.replace("\\040", " ")
-            try:
-                names = {n.lower() for n in os.listdir(mnt)}
-            except OSError:
-                continue
-            if {"transfer.dat", "indata.dat"} <= names:
-                return mnt
+            dev, mnt, _, opts = line.split()[:4]
+            out.append((dev, mnt.replace("\\040", " "), opts.split(",")))
+    return out
+
+
+def _is_r10_volume(mnt):
+    try:
+        names = {n.lower() for n in os.listdir(mnt)}
+    except OSError:
+        return False
+    return {"transfer.dat", "indata.dat"} <= names
+
+
+def find_r10_partitions():
+    """Block devices of attached R10s: the first partition of each whole disk
+    whose USB vendor/model is CANON / R10 (the vfat ONTOUCHLITE LUN)."""
+    parts = []
+    try:
+        disks = sorted(os.listdir("/sys/block"))
+    except OSError:
+        return parts
+    for d in disks:
+        base = "/sys/block/%s/device/" % d
+        try:
+            vendor = open(base + "vendor").read().strip()
+            model = open(base + "model").read().strip()
+        except OSError:
+            continue
+        if vendor.upper() != "CANON" or not model.upper().startswith("R10"):
+            continue
+        for p in sorted(os.listdir("/sys/block/" + d)):
+            if p.startswith(d) and os.path.exists("/dev/" + p):
+                parts.append("/dev/" + p)
+    return parts
+
+
+def _udisks(*args):
+    import shutil
+    import subprocess
+    exe = shutil.which("udisksctl")
+    if not exe:
+        raise ScannerError("udisksctl not found; mount the R10 volume by hand")
+    r = subprocess.run([exe] + list(args) + ["--no-user-interaction"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def find_volume(wait=10.0, log=None):
+    """Mount point of the R10's ONTOUCHLITE volume. If the scanner is attached
+    but the volume isn't mounted (or is mounted read-only), mount it read-write
+    with udisksctl (no root needed). Waits up to `wait` s for a just-plugged
+    scanner to appear."""
+    say = log or (lambda m: print(m, file=sys.stderr))
+    t0 = time.time()
+    while True:
+        for dev, mnt, opts in _mounts():
+            if _is_r10_volume(mnt):
+                if "ro" not in opts:
+                    return mnt
+                say("R10 volume %s is mounted read-only; remounting read-write" % mnt)
+                _udisks("unmount", "-b", dev)
+                break
+        parts = find_r10_partitions()
+        mounted = {dev for dev, _, _ in _mounts()}
+        for dev in parts:
+            if dev in mounted:
+                continue                      # e.g. the Mac HFS+ LUN, or not ours
+            rc, msg = _udisks("mount", "-b", dev, "-o", "rw")
+            if rc == 0:
+                say(msg)
+                for d, mnt, opts in _mounts():
+                    if d == dev and _is_r10_volume(mnt):
+                        return mnt
+            elif "already mounted" not in msg.lower() and dev.endswith("1"):
+                say("could not mount %s: %s" % (dev, msg))
+        if time.time() - t0 >= wait:
+            break
+        time.sleep(1.0)
+    if not parts:
+        raise ScannerError("no Canon R10 found (is it plugged in and switched on?)")
     raise ScannerError(
-        "R10 volume not mounted. Mount it read-write, e.g.\n"
-        "  udisksctl mount -b /dev/disk/by-id/usb-CANON_R10-0:0-part1")
+        "R10 found (%s) but its volume could not be mounted read-write. Try:\n"
+        "  udisksctl mount -b %s" % (", ".join(parts), parts[0]))
 
 
 def _real_name(directory, name):
@@ -1010,6 +1083,16 @@ def cmd_scan(r, a):
             if r.document_ready():
                 break
             log("no paper loaded - load a sheet and press the button again")
+    if a.wait_paper:
+        log("waiting for paper - feed a sheet (scanner button or Ctrl-C cancels)...")
+        while True:
+            got = wait_for_sheet(r)
+            if got != "paper":
+                log("cancelled - nothing scanned")
+                return
+            if r.document_ready():                    # still there: start
+                break
+            log("paper not detected any more - still waiting...")
     ready = r.document_ready()
     log("document ready status: %02x" % ready)
     if not ready and not a.no_paper_check:
@@ -1070,10 +1153,33 @@ def cmd_scan(r, a):
         r.define_scan_mode(0x36, b"")                    # no colour dropout
         r.scan(ids)
 
-    log("side mode %d, window ids %s" % (side, ids))
-    start_scan()
+    def start_scan_retry(attempts=3):
+        """SCAN can fail with 'no paper' (3/3A or 5/3A) when the sheet sensor
+        flickers or the sheet slips back after being detected. Wait for the
+        sheet to settle again and retry; False if it never takes."""
+        for n in range(1, attempts + 1):
+            try:
+                start_scan()
+                return True
+            except DeviceError as e:
+                if e.asc != 0x3A or n == attempts:
+                    if e.asc == 0x3A:
+                        log("no paper after %d attempts - finishing" % attempts)
+                        return False
+                    raise
+                log("no paper at scan start (attempt %d of %d) - waiting for the sheet..."
+                    % (n, attempts))
+                if wait_for_sheet(r, timeout=30) != "paper":
+                    log("no sheet - finishing")
+                    return False
+        return False
 
-    sink = (PdfSink(a.out, a.dpi, a.jpeg_quality, log) if a.out.lower().endswith(".pdf")
+    log("side mode %d, window ids %s" % (side, ids))
+    if not start_scan_retry():
+        return
+
+    jpeg_q = a.jpeg_quality if a.mode in ("color", "auto") else 0   # only colour pages use JPEG
+    sink = (PdfSink(a.out, a.dpi, jpeg_q, log) if a.out.lower().endswith(".pdf")
             else PngSink(a.out))
     page = 0
     try:
@@ -1097,7 +1203,12 @@ def cmd_scan(r, a):
                         "mode: canon_r10.py max-length 1000 (or 3000)"
                         % (page, caps["max_length"] / caps["base_yres"]))
                 plen = max(0, pinfo["paper_length"]) * a.dpi // 1200
-                sides = process_sides(data, w, ids, 3 if color else 1, luts, a, log, plen)
+                vbin = line_multiplier(len(data) // (w * len(ids) * (3 if color else 1)),
+                                       pinfo["paper_length"], a.dpi)
+                if vbin > 1:
+                    log("scanner returned %dx lines per paper line (long document mode, "
+                        "gray); merging every %d lines" % (vbin, vbin))
+                sides = process_sides(data, w, ids, 3 if color else 1, luts, a, log, plen, vbin)
                 order = sorted(sides, key=lambda t: a.order.index(t[0])) if len(sides) > 1 else sides
                 for label, iw, ih, ch, img in order:
                     sink.add(page, label, iw, ih, ch, img, log)
@@ -1121,10 +1232,38 @@ def cmd_scan(r, a):
                 break
             if not next_page(r, a.feed_timeout, log, a.verbose, a.button):
                 break
-            start_scan()                                 # the R10 needs a SCAN per sheet
+            if not start_scan_retry():                   # the R10 needs a SCAN per sheet
+                break
     finally:
         sink.close(log)
     log("%d sheet(s) scanned" % page)
+
+
+def wait_for_sheet(r, timeout=-1, settle=0.8, poll=0.08):
+    """Wait until a sheet is loaded and stays loaded for `settle` s (the paper
+    sensor flickers while a sheet is being inserted). The scanner button ends
+    the wait. -> "paper", "button", "timeout" or "interrupt"."""
+    t0 = time.time()
+    since = None                                  # time paper was first seen (current run)
+    n = 0
+    try:
+        while timeout < 0 or time.time() - t0 < timeout:
+            if r.button_down():
+                while r.button_down():
+                    time.sleep(poll)
+                return "button"
+            n += 1
+            if n % 3 == 0:                            # paper check every ~0.25 s
+                if r.document_ready():
+                    since = since or time.time()
+                    if time.time() - since >= settle:
+                        return "paper"
+                else:
+                    since = None
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        return "interrupt"
+    return "timeout"
 
 
 def next_page(r, feed_timeout, log, verbose, button=False):
@@ -1154,29 +1293,22 @@ def next_page(r, feed_timeout, log, verbose, button=False):
         except KeyboardInterrupt:
             log("finishing")
             return False
-    if r.document_ready():
-        return True
     if feed_timeout == 0:
-        return False
+        return bool(r.document_ready())
     log("feed the next sheet, or press the scanner button to finish%s..."
         % ("" if feed_timeout < 0 else " (waiting %ds)" % feed_timeout))
     t0 = time.time()
-    n = 0
-    try:
-        while feed_timeout < 0 or time.time() - t0 < feed_timeout:
-            if r.button_down():                          # button ends the batch
-                while r.button_down():
-                    time.sleep(0.08)
-                log("button pressed - finishing")
-                return False
-            n += 1
-            if n % 6 == 0 and r.document_ready():        # paper check every ~0.5 s
-                time.sleep(0.5)                          # let the sheet settle
+    while True:
+        left = -1 if feed_timeout < 0 else max(0.0, feed_timeout - (time.time() - t0))
+        got = wait_for_sheet(r, left)
+        if got == "paper":
+            if r.document_ready():
                 return True
-            time.sleep(0.08)
-    except KeyboardInterrupt:
-        log("finishing")
-    return False
+            log("paper not detected any more - still waiting...")
+            continue
+        log({"button": "button pressed - finishing", "interrupt": "finishing",
+             "timeout": "no sheet fed - finishing"}[got])
+        return False
 
 
 def write_png(path, width, height, channels, data):
@@ -1215,7 +1347,41 @@ def flip_vertical(data, width, height, channels=1):
     return b"".join(data[y * stride:(y + 1) * stride] for y in range(height - 1, -1, -1))
 
 
-def process_sides(data, w, ids, planes, luts, a, log, paper_len=0):
+def line_multiplier(lines, paper_len_1200, dpi):
+    """In long document mode gray scans come back with every paper line
+    repeated ~3x (the motor runs at colour speed; measured 3.02-3.05x on nine
+    A4 sheets). Compare lines received with what the scanner's own
+    paper-length measurement predicts (+0.39" lead-in overscan and ~20 trailing
+    lines); return the whole-number factor, or 1 if the data is normal."""
+    if paper_len_1200 <= 0:
+        return 1
+    expected = (paper_len_1200 + 0x1D8) * dpi / 1200.0 + 20
+    r = lines / expected
+    k = int(round(r))
+    return k if 2 <= k <= 4 and abs(r - k) < 0.3 else 1
+
+
+def vertical_bin(img, w, h, k):
+    """Average every k rows into one (16-bit lanes, one LUT pass)."""
+    import array, sys
+    lut = bytes(min(255, (v + k // 2) // k) for v in range(255 * k + 1))
+    lanes = bytearray(2 * w)
+    swap = sys.byteorder == "little"
+    nh = h // k
+    out = bytearray(w * nh)
+    for y in range(nh):
+        acc = 0
+        for j in range(k):
+            lanes[1::2] = img[(y * k + j) * w:(y * k + j + 1) * w]
+            acc += int.from_bytes(lanes, "big")
+        arr = array.array("H", acc.to_bytes(2 * w, "big"))
+        if swap:
+            arr.byteswap()
+        out[y * w:(y + 1) * w] = bytes(map(lut.__getitem__, arr))
+    return bytes(out), nh
+
+
+def process_sides(data, w, ids, planes, luts, a, log, paper_len=0, vbin=1):
     """Split sides (duplex: pixel-interleaved A/B) and colour planes (line-planar),
     apply shading, colour registration, orientation, deskew and crop.
     Window 0 (side A) arrives bottom-up; window 1 (side B) arrives rotated 180.
@@ -1235,16 +1401,19 @@ def process_sides(data, w, ids, planes, luts, a, log, paper_len=0):
                 img = apply_luts(img, w, luts[i][p])
             elif not a.no_normalize:
                 img = normalize(img, w, h)
+            ph = h
+            if vbin > 1:
+                img, ph = vertical_bin(img, w, h, vbin)
             if planes == 3 and p != 1:
                 # CIS lights R, G, B in sequence: R and B are sampled ~1/3 line
                 # either side of G; resample them onto G's position.
-                img = shift_rows(img, w, h, a.color_shift[0] if p == 0 else a.color_shift[1])
+                img = shift_rows(img, w, ph, a.color_shift[0] if p == 0 else a.color_shift[1])
             if not a.no_flip:
-                img = img[::-1] if wid == 1 else flip_vertical(img, w, h)
+                img = img[::-1] if wid == 1 else flip_vertical(img, w, ph)
             chans.append(img)
-        iw, ih = w, h
+        iw, ih = w, ph
         if not a.no_align:
-            chans, iw, ih = align_page(chans, w, h, log, "A" if wid == 0 else "B", paper_len, a.dpi)
+            chans, iw, ih = align_page(chans, w, ph, log, "A" if wid == 0 else "B", paper_len, a.dpi)
         label = "A" if wid == 0 else "B"
         if a.skip_blank:
             dark = dark_coverage(chans[1] if planes == 3 else chans[0], iw, ih, a.dpi)
@@ -1414,7 +1583,7 @@ def _inset(g, w, h, pos, axis, direction, span, limit=40):
         prev = m
     return limit
 
-def estimate_skew(g, w, h, max_deg=5.0, dpi=300):
+def estimate_skew(g, w, h, max_deg=5.0, dpi=300, detail=False):
     """Content-based skew (projection profile): the angle at which the dark
     pixels' row histogram is sharpest. Returns s = dx/dy of vertical lines, or
     None when the page has too little content."""
@@ -1460,7 +1629,26 @@ def estimate_skew(g, w, h, max_deg=5.0, dpi=300):
         picks.append((gain, best, vertical))
     gain, best, vertical = max(picks)
     best = max((score(best + d / 40, vertical), best + d / 40) for d in range(-10, 11))[1]
-    return math.tan(math.radians(best))
+    if not detail:
+        return math.tan(math.radians(best))
+    # the other orientation too (horizontal text: vertical rules/column edges)
+    ogain, obest, overt = min(picks)
+    obest = max((score(obest + d / 40, overt), obest + d / 40) for d in range(-10, 11))[1]
+    return {"s": math.tan(math.radians(best)), "gain": gain, "vertical": vertical,
+            "other_s": math.tan(math.radians(obest)), "other_gain": ogain}
+
+
+def backing_level(g, w, h):
+    """Scanner backing brightness: the darker of the top/bottom overscan-strip
+    medians (the strips above/below the paper)."""
+    import statistics
+    x0, x1 = w // 4, 3 * w // 4
+    meds = []
+    for rows in (range(0, min(24, h)), range(max(0, h - 12), h)):
+        vals = [v for y in rows for v in g[y * w + x0:y * w + x1:5]]
+        if vals:
+            meds.append(statistics.median(vals))
+    return min(meds) if meds else 255
 
 
 def geometry_gray(g, w, h):
@@ -1469,37 +1657,92 @@ def geometry_gray(g, w, h):
     so the backing clips again, which is what the shadow detector expects.
     The backing level is the darker of the top/bottom strip medians (the
     overscan above/below the paper)."""
-    import statistics
-    x0, x1 = w // 4, 3 * w // 4
-    meds = []
-    for rows in (range(0, min(24, h)), range(max(0, h - 12), h)):
-        vals = [v for y in rows for v in g[y * w + x0:y * w + x1:5]]
-        if vals:
-            meds.append(statistics.median(vals))
-    b = min(meds) if meds else 255
+    b = backing_level(g, w, h)
     if b >= 250 or b < 120:
         return g
     k = 262.0 / b
     return g.translate(bytes(min(255, int(v * k)) for v in range(256)))
 
 
+def _outside_is_empty(g, w, h, side, line, dpi, max_ink=0.002, raw=None, backing=255):
+    """A real paper edge has only scanner backing beyond it (white in the
+    geometry image). A table rule or text block has more printing beyond it.
+    Checks the strip between the line (+ a few px for its shadow) and the image
+    border; a strip under 0.05" wide counts as empty."""
+    a, b = line[0], line[1]
+    gap = max(3, dpi // 60)
+    mask = bytes(1 if v < 128 else 0 for v in range(256))
+    n = k = 0
+    rawvals = []
+    if side in ("left", "right"):
+        for y in range(int(h * 0.05), int(h * 0.95), 4):
+            x = int(round(a + b * y))
+            lo, hi = (0, max(0, x - gap)) if side == "left" else (min(w, x + gap + 1), w)
+            seg = g[y * w + lo:y * w + hi]
+            k += seg.translate(mask).count(1)
+            n += len(seg)
+            if raw is not None and hi > lo:
+                rawvals.extend(raw[y * w + lo:y * w + hi:3])
+    else:
+        for x in range(int(w * 0.05), int(w * 0.95), 4):
+            y = int(round(a + b * x))
+            lo, hi = (0, max(0, y - gap)) if side == "top" else (min(h, y + gap + 1), h)
+            seg = g[x + lo * w:x + hi * w:w]
+            k += seg.translate(mask).count(1)
+            n += len(seg)
+            if raw is not None and hi > lo:
+                rawvals.extend(raw[x + lo * w:x + hi * w:3 * w])
+    span = (h if side in ("left", "right") else w) * 0.9 / 4
+    if n < span * dpi * 0.05:                     # strip narrower than ~0.05" on average
+        return True
+    if k / n > max_ink:
+        return False
+    # With the factory light curve the backing (~210) is darker than paper
+    # (~230): a bright strip beyond the "edge" is paper margin, not backing.
+    if rawvals and backing < 245:
+        rawvals.sort()
+        if rawvals[len(rawvals) // 2] > backing + 10:
+            return False
+    return True
+
+
 def align_page(chans, w, h, log, label, paper_len=0, dpi=300):
     """Deskew using the paper-edge shadows, then crop to the paper."""
     g = chans[1] if len(chans) == 3 else chans[0]
-    s = estimate_skew(g, w, h, dpi=dpi)
+    est = estimate_skew(g, w, h, dpi=dpi, detail=True)
+    s = est["s"] if est else None
+    sv = sh = s                                   # vertical-line / horizontal-line skew
     how = "text"
+    if est:
+        # The front sensor's image is slightly sheared (text lines vs vertical
+        # rules differ by ~0.3 deg), so use the other orientation's angle for
+        # its own direction when it is measurable and close.
+        o = est["other_s"]
+        if (est["other_gain"] >= 1.06 and abs(math.degrees(math.atan(o)) -
+                                              math.degrees(math.atan(s))) <= 0.6):
+            if est["vertical"]:
+                sh = o
+            else:
+                sv = o
+            how = "text+rules"
     if s is None:                                # blank-ish page: use the edge shadows
         lines = find_paper_lines(geometry_gray(g, w, h), w, h, dpi)
         cands = [(len(lines[k][2]) / (h / 8), lines[k][1]) for k in ("left", "right") if lines[k]]
         cands += [(len(lines[k][2]) / (w / 8), -lines[k][1]) for k in ("top", "bottom") if lines[k]]
         s = max(cands)[1] if cands else 0.0
+        sv = sh = s
         how = "edges"
     lines = None
-    if abs(s) * max(w, h) >= 1.0:
-        chans = [shear_cols(shear_rows(c, w, h, s), w, h, s) for c in chans]
+    if max(abs(sv), abs(sh)) * max(w, h) >= 1.0:
+        chans = [shear_cols(shear_rows(c, w, h, sv), w, h, sh) for c in chans]
         g = chans[1] if len(chans) == 3 else chans[0]
     g = geometry_gray(g, w, h)
+    raw_g = chans[1] if len(chans) == 3 else chans[0]
+    bk = backing_level(raw_g, w, h)
     lines = find_paper_lines(g, w, h, dpi)
+    for k in list(lines):
+        if lines[k] and not _outside_is_empty(g, w, h, k, lines[k], dpi, raw=raw_g, backing=bk):
+            lines[k] = None                      # e.g. a table rule when the paper edge is off-scan
     lim = int(40 * dpi / 300)
     found = [k for k in lines if lines[k]]
     # horizontal extent of the top/bottom shadow = paper width where side edges are invisible
@@ -1511,12 +1754,16 @@ def align_page(chans, w, h, log, label, paper_len=0, dpi=300):
     # Use each edge's outermost point over the page so a slightly non-square
     # sheet (hand-folded, trimmed) is not clipped at one end.
     if lines["left"]:
-        lx = int(round(min(at(lines["left"], u) for u in vspan)))
+        ends_l = [at(lines["left"], u) for u in vspan]
+        # slightly slanted after deskew (< 0.1"): crop at the inner point so the
+        # edge shadow isn't left in; larger differences = non-square sheet, keep all
+        lx = int(round(max(ends_l) if max(ends_l) - min(ends_l) < 0.1 * dpi else min(ends_l)))
         x0 = lx + _inset(g, w, h, lx, "x", 1, vspan, lim)
     elif ext:
         x0 = min(e[0] for e in ext) + 4
     if lines["right"]:
-        rx = int(round(max(at(lines["right"], u) for u in vspan)))
+        ends_r = [at(lines["right"], u) for u in vspan]
+        rx = int(round(min(ends_r) if max(ends_r) - min(ends_r) < 0.1 * dpi else max(ends_r)))
         x1 = rx - _inset(g, w, h, rx, "x", -1, vspan, lim) + 1
     elif ext:
         x1 = max(e[1] for e in ext) - 4
@@ -1552,8 +1799,9 @@ def align_page(chans, w, h, log, label, paper_len=0, dpi=300):
         x0, x1, y0, y1 = 0, w, 0, h
     nw, nh = x1 - x0, y1 - y0
     chans = [b"".join(c[y * w + x0:y * w + x1] for y in range(y0, y1)) for c in chans]
-    log("side %s: skew %.2f deg (%s), edges %s, crop x %d..%d y %d..%d -> %dx%d (%.2fx%.2f in)"
-        % (label, math.degrees(math.atan(s)), how, "+".join(found) or "none",
+    log("side %s: skew %s deg (%s), edges %s, crop x %d..%d y %d..%d -> %dx%d (%.2fx%.2f in)"
+        % (label, "%.2f" % math.degrees(math.atan(sh)) if math.isclose(sh, sv) else
+           "%.2f/%.2f" % (math.degrees(math.atan(sh)), math.degrees(math.atan(sv))), how, "+".join(found) or "none",
            x0, x1, y0, y1, nw, nh, nw / dpi, nh / dpi))
     return chans, nw, nh
 
@@ -1617,6 +1865,8 @@ class PdfSink:
                 log("colour pages: %s" % ("JPEG quality %d (%s)" % (jpeg_quality, name) if name else
                     "lossless - no JPEG encoder (install Pillow, or put cjpeg on PATH: "
                     "nix shell nixpkgs#libjpeg_turbo)"))
+        if os.path.dirname(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
         self.f = open(path + ".part", "wb")
         self.offsets = []
         self.pages = []
@@ -1752,7 +2002,14 @@ def cmd_raw(r, a):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""quick start:
+  canon_r10.py --default-col     colour, 300 dpi, both sides, PDF; feed sheets, button to finish
+  canon_r10.py --default-bw      the same in black and white
+  canon_r10.py scan --help       all scan options, presets and recommended settings
+  canon_r10.py max-length 1000   long document mode (sheets up to 1 m)""")
     ap.add_argument("--volume", help="mount point of ONTOUCHLITE (auto)")
     ap.add_argument("--timeout", type=float, default=90.0)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -1771,9 +2028,48 @@ def main():
     p.add_argument("cdb", help="hex, e.g. 120000006000")
     p.add_argument("--read", type=int, default=0, help="data-in length")
     p.add_argument("--data-out", help="hex data-out payload")
-    p = sub.add_parser("scan", help="scan every sheet in the feeder")
-    p.add_argument("-o", "--out", default="scans",
-                   help="directory for PNGs, or a file name ending in .pdf")
+    p = sub.add_parser(
+        "scan", help="scan every sheet in the feeder",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""presets (also usable without 'scan', e.g. canon_r10.py --default-col):
+  --default-col   colour pages, saved as JPEG (quality 85) in the PDF
+  --default-bw    black-and-white 1-bit pages (threshold 170, isolated specks removed)
+  Both: 300 dpi, both sides, one PDF (default name scan-YYYYmmdd-HHMMSS.pdf, or -o).
+        Waits for the first sheet (button/Ctrl-C cancels), scans each sheet as it
+        is fed, and finishes when the scanner button is pressed (Ctrl-C also saves).
+        Blank sides are skipped (--keep-blank to keep them).
+  Mode, dpi and duplex are fixed by the preset; other options still apply.
+
+output (-o):
+  canon_r10.py --default-col                       ./scan-20250101-093000.pdf
+  canon_r10.py --default-col -o ~/papercut/        ~/papercut/scan-20250101-093000.pdf
+  canon_r10.py --default-bw  -o ~/scans/bill.pdf   ~/scans/bill.pdf
+  canon_r10.py scan -o letters.pdf                 letters.pdf
+  canon_r10.py scan -o pages                       pages/page000_A.png, page000_B.png, ...
+  A folder given to a preset is created if missing. An existing PDF is overwritten.
+
+recommended image settings (on by default for every scan, presets included):
+  factory light-curve correction   (--no-light-curve to disable)
+  deskew + crop to the paper       (--no-align)
+  auto levels: black/white point from each page  (--black-point/--white-point)
+  sharpening: 0.75 at 300 dpi, 0.4 at 600 dpi   (--sharpen, 0 = off)
+  colour noise (speck) removal: radius 2         (--chroma-denoise, 0 = off)
+  all enhancement off: --no-enhance""")
+    p.add_argument("-o", "--out", default=None, metavar="PATH",
+                   help="where to save. Ending in .pdf: that PDF file. A folder (existing, "
+                        "or ending in /): with a preset, scan-YYYYmmdd-HHMMSS.pdf inside it; "
+                        "otherwise one PNG per side in it. Default: presets save "
+                        "scan-YYYYmmdd-HHMMSS.pdf in the current folder, plain scans save PNGs "
+                        "in ./scans/. See 'output' below.")
+    p.add_argument("--default-col", action="store_true",
+                   help="preset for colour documents (see 'presets' below)")
+    p.add_argument("--default-bw", action="store_true",
+                   help="preset for black-and-white text documents (see 'presets' below)")
+    p.add_argument("--keep-blank", action="store_true",
+                   help="presets: keep blank sides (blank-page skipping is on by default)")
+    p.add_argument("--wait-paper", action="store_true",
+                   help="wait for the first sheet instead of failing when the feeder is "
+                        "empty (the button cancels while waiting)")
     p.add_argument("--dpi", type=int, default=300)
     p.add_argument("--mode", choices=["gray", "color", "bw", "auto"], default="gray",
                    help="bw = black-and-white text mode (gray scan, 1-bit output); "
@@ -1827,7 +2123,29 @@ def main():
     p.add_argument("--keep-raw", action="store_true", help="also save the raw stream")
     p.add_argument("--no-normalize", action="store_true", help="(uncalibrated only) skip software levels")
     p.add_argument("--no-flip", action="store_true", help="keep raw line order")
-    a = ap.parse_args()
+    argv = sys.argv[1:]
+    if any(x in ("--default-col", "--default-bw") for x in argv) and "scan" not in argv:
+        argv = ["scan"] + argv                    # allow: canon_r10.py --default-col
+    a = ap.parse_args(argv)
+    if a.cmd == "scan":
+        if a.default_col and a.default_bw:
+            ap.error("--default-col and --default-bw are mutually exclusive")
+        if a.default_col or a.default_bw:
+            a.mode = "color" if a.default_col else "bw"
+            a.dpi, a.duplex, a.wait_paper, a.single, a.button = a.dpi, True, True, False, False
+            a.skip_blank = not a.keep_blank
+            stamp = time.strftime("scan-%Y%m%d-%H%M%S.pdf")
+            if a.out is None:
+                a.out = stamp
+            elif not a.out.lower().endswith(".pdf"):
+                out = os.path.expanduser(a.out)
+                if not (os.path.isdir(out) or a.out.endswith("/")):
+                    ap.error("-o %s: with a preset give a folder (existing, or ending in /) "
+                             "or a file name ending in .pdf" % a.out)
+                os.makedirs(out, exist_ok=True)
+                a.out = os.path.join(out, stamp)
+        elif a.out is None:
+            a.out = "scans"
 
     try:
         with FileTransport(a.volume, a.timeout, a.verbose) as t:

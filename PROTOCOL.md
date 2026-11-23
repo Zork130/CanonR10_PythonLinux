@@ -83,6 +83,23 @@ State machine (8 lines averaged to one line, values 0–4095):
 Then a white reference (ids FE) and a dark reference (ids FF) build the shading:
 `coef = (T<<12)/(white−black)` (T = 4316 gray; 4306/4317/4349 R/G/B), `out = clamp((pix − black>>4)·coef >> 12)`.
 
+## Factory light-curve correction (ported)
+After the white/black references, the vendor reads 0x80000 bytes at 0x10080000 (READ BUFFER 0x3B) and runs
+`AdjustLightFix` → `CSpecialFilter::makeShadingData` → `CAdjustLight::AdjustLightCurve` →
+`CLightCurveAdjustData::LoadData/AdjustData` (LLiPmDRP215). Layout (little-endian):
+- header: u32 timestamp (Unix; this unit: 2022-07-26), u32 0, u32 record count (12). First word FFFFFFFF = no data.
+- record: u16 header_len (34), u16 side (0 front / 1 back), u16 planes (1 gray / 3 RGB), u16 bits (16),
+  u32 divisor (4096), u32 width (2552 / 5104), u32 plane_bytes, u32 data_bytes, u16 dpi, u16 per_plane (1),
+  u32 flags (bit0 = valid), u8 colour-dropout, u8 emphasis; then data_bytes of u16 per-pixel values.
+  Records are front/back × gray/RGB × 300/600 dpi, plus a gray "emphasis" variant (byte 33 = 1) used only with
+  colour dropout/emphasis options (tables at 0x9cbc0/0x9cbe0); normal scans use dropout = emphasis = 0.
+- Applied per column x and plane: `white'[x] = black[x] + max(0, white[x] − black[x]) · curve[x] / divisor`
+  (rounded, clamped to 0xFFFF), before the shading coefficients are computed.
+Values are about 5100–5800 (×1.25–1.36, varying up to ~6% across the width). Effect measured on the same sheet: without it
+95% of the paper clipped at 255; with it paper sits at about 232 with < 4% clipped, flat to about ±2 levels across the page.
+canon_r10.py caches the block per scanner (`<serial>-lightcurve.bin`, re-read when the timestamp changes);
+`--no-light-curve` disables it. A dump of this unit's block is in `dump/factory_lightcurve.bin`.
+
 ## Colour registration
 The CIS lights the R, G and B LEDs in sequence while the paper moves, so in raw line order
 R is sampled +1/3 line and B −1/3 line from G. Measured by cross-correlating the plane
@@ -100,18 +117,27 @@ white/black reference lines). A cached calibration is reused for 300 s (vendor v
   The R10 stops by itself about 0.4" after the trailing edge.
 - After each sheet the vendor driver reads three 16-byte blocks (four BE32 values each, 1/1200"):
   - `28 00 80 00 00 04 000010 00`: [3] = measured paper length (A4 reads 14112–14124)
+    **−1 = no trailing edge seen**: the sheet is longer than the window (max_length 14.14" plus overscan, about 14.5" of
+    paper). The R10 then stops the motor with the tail still inside and latches 3/80 00 (paper jam); seen live with a
+    long folded leaflet. Canon's app has a "Long Document mode" (strings in R10Lite.ds), not investigated.
   - `28 00 80 00 00 00 000010 00`: the scan window actually used (0, uly, width, length)
   - `28 00 80 00 00 01 000010 00`: (0, ~440, 0, 464), per-side leading-edge offsets
 - Between sheets: poll `READ dtc A1` (1 byte) until it is non-zero. The next READ then fails with 5/2C00
   until a new SCAN is sent: **each sheet needs its own SCAN**. The feeder takes one sheet at a time.
 
 ## Paper alignment (software)
-- Skew from content (projection profile of dark pixels, ±5° coarse then 0.025° fine), falling back to
+- Skew from content: projection profile of the ink pixels (dark ones, or light ones on mostly dark pages) in both
+  orientations (horizontal and sideways text), keeping whichever has the sharper peak; ±5° coarse, then 0.025° fine. It falls back to
   edge-shadow lines on near-blank pages. Deskew = row shear plus column shear (nearest pixel).
 - Only edges facing away from the light cast a shadow: side A shows right+top, side B shows bottom.
   Edges are accepted only as RANSAC lines covering ≥ 50% (vertical) / 35% (horizontal) of the page.
   A missing side edge comes from the extent of the top/bottom shadow; the missing horizontal edge is
-  the visible one ± the measured paper length.
+  the visible one ± the measured paper length. A detected opposite edge is kept when it agrees with the measured
+  length to 0.15". Each edge is taken at its outermost point (hand-folded sheets are not exactly rectangular), and the
+  inward trim stops when the edge profile flattens, so dark paper doesn't lose 40 px per edge.
+- With the factory light curve the backing reads about 210 (paper about 232) instead of clipping at 255. Edge finding runs on a
+  copy scaled by 262/backing (backing taken as the darker of the top/bottom overscan-strip medians), which
+  restores the clipped backing the shadow detector was tuned on. Crops get an extra 0.01" trim on each side.
 
 ## 600 dpi
 Calibration uses exposure 3500 at state 3 and limits 5000/6000 (both from the vendor code) and converges like 300 dpi.
@@ -121,17 +147,35 @@ The alignment geometry (edge bands, tolerances, insets) scales with dpi.
 ## Text clarity (software)
 After shading, ink only reaches about 80–100 and edges are soft (CIS optics). The vendor driver applies gamma/contrast
 tables and optional edge emphasis (`_MakeGammaTable`, `sContrastTable`, `cf_EmphasisEdge`, not ported).
-canon_r10.py instead applies levels (auto black point = darkest 0.3% − 10, capped at 110; white point 240) and then an
+canon_r10.py instead applies levels (auto black point = darkest 0.3% − 10, capped at 110; auto white point = paper
+median − 2·(median − lower quartile), within 200–250) and then an
 unsharp mask (box radius 1 / amount 0.75 at 300 dpi, radius 2 / amount 0.4 at 600 dpi; gentler at 600 because it
 otherwise brings out halftone grain). On a 300 dpi text sample, mean ink went from 65 to 36 and the soft edge pixels dropped by 37%.
+Colour: once highlights stopped clipping (factory light curve), per-channel sensor noise showed as pink/cyan
+specks on white paper. Before sharpening, R−G and B−G are box-smoothed over 5×5 (`--chroma-denoise 2`) only where
+that local mean difference is ≤ 12 (near-neutral areas), so printed colour and halftones are untouched. Measured:
+tinted paper pixels 0.066% → 0.003%, with the mean of a printed orange unchanged (255,150,32 vs 255,151,33 unsharpened).
+Sharpening brightness only was tried and rejected: it pulled saturated colours down (R 255 → 241).
 Cost: about 0.2 s per 300 dpi gray page, about 3 s per 600 dpi colour page. Options: `--no-enhance`, `--sharpen`,
 `--black-point`, `--white-point`, `--gamma`.
 
 ## Black-and-white mode (software)
 `--mode bw` scans in gray (and shares the gray calibration), applies the text-clarity steps, then thresholds at 170
-(`--threshold`). 128 breaks up grey/halftone headings and 192 picks up paper specks. Output is packed 1-bit
+(`--threshold`). 128 breaks up grey/halftone headings and 192 picks up paper specks. Isolated single black
+pixels are then removed (bitwise on packed rows; `--no-despeckle`). Output is packed 1-bit
 (1 = white; PNG bit depth 1, PDF `/BitsPerComponent 1`, Flate): about 0.14 MB per 300 dpi A4 page versus about 1.3 MB gray.
 Photos and halftone logos lose detail; the vendor's error-diffusion mode is not implemented.
+
+## Blank-page skip and automatic colour/gray (software)
+- `--skip-blank`: computed before contrast stretching (which would turn show-through into "ink"). Percent of interior
+  pixels (0.25" inset) darker than 0.35 × paper level (75th percentile), blank below `--blank-threshold` 0.005%.
+  Measured: blank back with heavy show-through and translucent grease spots 0.0001%; text pages 5–7%; dark
+  leaflet 8–58%. A page carrying only a page number is about 0.01%.
+- `--mode auto`: scans and calibrates in colour, then measures colour on 6×6 px block means after enhancement
+  (averaging cancels the alternating red/blue fringes at black-text edges). Spread > 36 counts as a colour block.
+  Below `--colour-threshold` 0.25% of blocks, the side is saved as gray (Rec.601 luma).
+  Measured: black-text page 0.000–0.001%, blank-with-show-through 0.049%, insurance-letter page with only teal headings 0.96%,
+  logo page 1.6%, LEGO leaflet 3.7–33%.
 
 ## Scanner button
 Vendor status "OperationpanelEZKeyStatus" (`CCanoDR::GetStatus`): READ `28 00 84 00 00 00 000008 00`.
@@ -170,6 +214,26 @@ dialogs, 0x40000000 = cancelled. TEST UNIT READY returns good even with the cove
 feeder with READ 8B (or REQUEST SENSE after it).
 
 ## TODO
-- Factory light-curve correction (AdjustLightFix with READ BUFFER 0x10080000, 512 KiB) is not ported.
+Features
+- Long document mode: sheets over the 14.14" max_length stop with a jam (3/80 00, paper_length −1). Canon's app has a
+  "Long Document mode" (strings `LongDocumentMode Info`, `label_max_length_for_pp_size` in R10Lite.ds). Find how
+  it extends the window (larger SET WINDOW length / a DEFINE SCAN MODE flag) and whether the R10 firmware allows it.
+- Button cancels a sheet mid-scan (vendor polls the key during READ, `SetEzKeyAbort`); currently it only ends a batch between sheets.
+- Double-feed detection (DEFINE SCAN MODE page 0x30; sense 3/81 01 is already decoded).
+- Software resolutions other than 300/600, error-diffusion B&W.
+- Searchable PDF (OCR; the device ships Canon's OCR component as appfile2).
+- Roller/pad counters (READ dtc 8C) and counter reset.
+
+Quality / speed
 - Gray LED exposure uses the 31% rate path rather than the vendor "BunZGray" register routine.
 - Rotation uses nearest-pixel shears (fine for documents; slight stair-stepping on photos).
+- Pure-Python processing: 600 dpi colour duplex takes about 56 s and 700 MB per sheet; optional numpy path.
+
+Usability
+- Needs the ONTOUCHLITE volume mounted read-write by hand (`udisksctl mount`); udev rule / auto-mount.
+
+Untested live
+- Final alignment changes (sideways and white-on-black text, non-square sheets) were checked offline only.
+- 0.01" crop trim; the long-sheet jam warning; 600 dpi with the factory light curve; colour chroma denoise on a fresh scan.
+- Error codes other than cover open (3/80 01) and jam (3/80 00) were taken from vendor code only.
+- tools/decode_bot.py was never run on a real capture.

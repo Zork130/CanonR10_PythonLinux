@@ -537,10 +537,25 @@ class Calibrator:
         self.set_adjust_data()
         return self.shading(self.white, self.black)
 
+    curves = None                     # factory light curves, set by the caller
+
     def shading(self, white, black):
         """-> [side][plane] list of per-column 256-byte LUTs."""
         targets = SHADING_TARGET_RGB if self.color else (SHADING_TARGET_GRAY,)
         out = []
+        white = [list(p) for p in white]
+        if self.curves:
+            nplanes = 3 if self.color else 1
+            for s in range(self.sides):
+                rec = self.curves.get((s, nplanes, self.dpi))
+                if rec is None:
+                    self.log("  side %d: no factory light curve" % s)
+                    continue
+                div, curve = rec
+                for p in range(nplanes):
+                    white[s][p] = apply_light_curve(white[s][p], black[s][p], div, curve[p])
+                self.log("  side %d: factory light curve applied (mean x%.3f)"
+                         % (s, sum(curve[0]) / len(curve[0]) / div))
         for s in range(self.sides):
             planes = []
             for p, T in enumerate(targets):
@@ -591,13 +606,15 @@ def shift_rows(img, w, h, f):
 # around it) and edges are soft. The vendor driver applies gamma/contrast tables
 # and optional edge emphasis; this is the equivalent done in software.
 
-def levels_lut(img, black=None, white=240, gamma=1.0):
-    """LUT stretching [black, white] to [0, 255]. black=None: auto from the
-    darkest 0.3% of pixels (capped so blank pages are left alone)."""
+def levels_lut(img, black=None, white=None, gamma=1.0):
+    """LUT stretching [black, white] to [0, 255].
+    black=None: auto from the darkest 0.3% of pixels (capped so blank pages are
+    left alone). white=None: auto from the paper level (median - 2*(median -
+    lower quartile) of pixels >= 150), kept within 200..250."""
+    hist = [0] * 256
+    for v, c in __import__("collections").Counter(img[::7]).items():
+        hist[v] = c
     if black is None:
-        hist = [0] * 256
-        for v, c in __import__("collections").Counter(img[::7]).items():
-            hist[v] = c
         n, acc, black = sum(hist) * 0.003, 0, 0
         for v in range(256):
             acc += hist[v]
@@ -605,6 +622,22 @@ def levels_lut(img, black=None, white=240, gamma=1.0):
                 black = v
                 break
         black = min(max(black - 10, 0), 110)
+    if white is None:
+        # paper = pixels >= 150; put the white point two lower-quartile spreads
+        # under the paper median so the paper texture becomes clean white
+        paper = hist[150:]
+        tot = sum(paper)
+        med = q1 = 255
+        if tot:
+            acc = 0
+            for i, c in enumerate(paper):
+                acc += c
+                if q1 == 255 and acc >= tot * 0.25:
+                    q1 = 150 + i
+                if acc >= tot * 0.5:
+                    med = 150 + i
+                    break
+        white = min(250, max(200, med - 2 * (med - q1)))
     span = max(1, white - black)
     return bytes(0 if v <= black else 255 if v >= white else
                  int(255 * ((v - black) / span) ** gamma + 0.5) for v in range(256))
@@ -657,10 +690,78 @@ def enhance(chans, w, h, a):
     lut = levels_lut(g, a.black_point, a.white_point, a.gamma)
     radius = max(1, a.dpi // 300)
     amount = a.sharpen if a.sharpen is not None else (0.75 if a.dpi == 300 else 0.4)
-    return [sharpen(c.translate(lut), w, h, amount, radius) for c in chans]
+    chans = [c.translate(lut) for c in chans]
+    if len(chans) == 3 and a.chroma_denoise:
+        # Per-channel sensor noise shows as pink/cyan specks on white paper once
+        # highlights are no longer clipped: smooth R-G and B-G in near-neutral
+        # areas first. (Sharpening only brightness instead was tried; adding G's
+        # halftone texture to saturated channels shifts printed colours.)
+        r, g, b = chans
+        chans = [chroma_denoise(r, g, w, h, a.chroma_denoise), g,
+                 chroma_denoise(b, g, w, h, a.chroma_denoise)]
+    return [sharpen(c, w, h, amount, radius) for c in chans]
 
 
-def to_bilevel(img, w, h, threshold=170):
+def chroma_denoise(c, g, w, h, radius=2, tol=12):
+    """c' = g + boxblur(c - g): smooth the colour difference to green over a
+    (2r+1)^2 box while keeping full-resolution brightness (g). Removes the
+    per-channel sensor noise that shows as pink/cyan specks on white paper.
+    16-bit lanes: diff + 255 in 0..510, box sum <= 25*510 (r=2)."""
+    import array, sys
+    n = (2 * radius + 1) ** 2
+    lo = n * 255
+    top = n * 255 + n * 510
+    lut = [0] * (top + 1)
+    for v in range(top + 1):
+        q = (v - lo + n // 2) // n
+        lut[v] = 0 if q < 0 else 255 if q > 255 else q
+    lanes = bytearray(2 * w)
+    mask = (1 << (16 * w)) - 1
+    off = int.from_bytes(b"\x00\xff" * w, "big")          # +255 per lane
+    swap = sys.byteorder == "little"
+
+    def tolane(row):
+        lanes[1::2] = row
+        return int.from_bytes(lanes, "big")
+
+    gl, hs = [], []
+    for y in range(h):
+        sl = slice(y * w, (y + 1) * w)
+        G = tolane(g[sl])
+        D = tolane(c[sl]) + off - G
+        H = D
+        for k in range(1, radius + 1):
+            H += ((D << (16 * k)) & mask) + (D >> (16 * k))
+        gl.append(G)
+        hs.append(H)
+    # only near-neutral areas (|mean(c - g)| <= tol) are smoothed, so printed
+    # colour (halftone dots of different inks) is left exactly as scanned
+    gate = [0] * (n * 510 + 1)
+    for v in range(len(gate)):
+        if abs(v - lo) <= n * tol:
+            gate[v] = 255
+    out = bytearray(w * h)
+    S = sum(hs[min(max(k, 0), h - 1)] for k in range(-radius - 1, radius))
+    for y in range(h):
+        S += hs[min(y + radius, h - 1)] - hs[min(max(y - radius - 1, 0), h - 1)]
+        v = n * gl[y] + S               # n*g + sum(c - g + 255); edge columns see fewer terms
+        arr = array.array("H", v.to_bytes(2 * w, "big"))
+        sarr = array.array("H", S.to_bytes(2 * w, "big"))
+        if swap:
+            arr.byteswap()
+            sarr.byteswap()
+        sm = int.from_bytes(bytes(map(lut.__getitem__, arr)), "big")
+        gm = int.from_bytes(bytes(map(gate.__getitem__, sarr)), "big")
+        orig = c[y * w:(y + 1) * w]
+        mixed = (sm & gm) | (int.from_bytes(orig, "big") & ~gm)
+        row = bytearray(mixed.to_bytes(w, "big"))
+        row[:radius] = c[y * w:y * w + radius]            # window runs off the edge:
+        row[w - radius:] = c[(y + 1) * w - radius:(y + 1) * w]   # keep the original there
+        out[y * w:(y + 1) * w] = row
+    return bytes(out)
+
+
+def to_bilevel(img, w, h, threshold=170, despeckle_on=True):
     """8-bit gray -> packed 1-bit rows (MSB first, 1 = white, rows padded to a
     byte), the layout PNG and PDF both use. Each of the 8 bit positions is a
     translate to its bit weight; the disjoint bits are summed as one big int."""
@@ -672,7 +773,194 @@ def to_bilevel(img, w, h, threshold=170):
     for k in range(8):
         t = bytes((0x80 >> k) if v >= threshold else 0 for v in range(256))
         acc += int.from_bytes(img[k::8].translate(t), "big")
-    return acc.to_bytes(len(img) // 8, "big")
+    packed = acc.to_bytes(len(img) // 8, "big")
+    return despeckle(packed, (w + pad) // 8, h) if despeckle_on else packed
+
+
+def despeckle(packed, stride, h):
+    """Turn isolated black pixels (no black among the 8 neighbours) white.
+    Works on whole rows as big ints (black = 1 after inverting)."""
+    nbits = stride * 8
+    full = (1 << nbits) - 1
+    rows = [full ^ int.from_bytes(packed[y * stride:(y + 1) * stride], "big") for y in range(h)]
+    out = bytearray(len(packed))
+    for y in range(h):
+        r = rows[y]
+        if r:
+            up = rows[y - 1] if y else 0
+            dn = rows[y + 1] if y + 1 < h else 0
+            v = up | dn
+            nb = ((r << 1) | (r >> 1) | v | (v << 1) | (v >> 1)) & full
+            r &= nb                                   # keep pixels with a neighbour
+        out[y * stride:(y + 1) * stride] = (full ^ r).to_bytes(stride, "big")
+    return bytes(out)
+
+
+# ---- page classification: blank / colour ------------------------------------------
+
+def ink_coverage(g, w, h, dpi):
+    """Percent of interior pixels (0.25" in from the edges) darker than 128.
+    Run on the enhanced page, where paper is white and ink is dark."""
+    m = dpi // 4
+    if w <= 2 * m or h <= 2 * m:
+        return 100.0
+    mask = bytes(1 if v < 128 else 0 for v in range(256))
+    n = k = 0
+    for y in range(m, h - m, 2):
+        row = g[y * w + m:(y + 1) * w - m:2]
+        k += row.translate(mask).count(1)
+        n += len(row)
+    return 100.0 * k / n
+
+
+def dark_coverage(g, w, h, dpi, frac=0.35):
+    """Blank-page metric on the shaded (not contrast-stretched) page: percent of
+    interior pixels darker than frac * paper level. Real ink is ~5-30 against
+    paper ~230; show-through from the other side never gets that dark."""
+    m = dpi // 4
+    if w <= 2 * m or h <= 2 * m:
+        return 100.0
+    sample = sorted(g[m * w + m:(h - m) * w:211])
+    paper = sample[len(sample) * 3 // 4] if sample else 255      # paper dominates a blank page
+    cut = int(paper * frac)
+    mask = bytes(1 if v < cut else 0 for v in range(256))
+    n = k = 0
+    for y in range(m, h - m, 2):
+        row = g[y * w + m:(y + 1) * w - m:2]
+        k += row.translate(mask).count(1)
+        n += len(row)
+    return 100.0 * k / n
+
+
+def to_luma(chans, w, h):
+    """RGB planes -> gray (Rec.601 weights 77/150/29 /256) via 16-bit lanes."""
+    import array, sys
+    r, g, b = chans
+    lut = bytes(min(255, v >> 8) for v in range(65536))
+    lanes = bytearray(2 * w)
+    swap = sys.byteorder == "little"
+    out = bytearray(w * h)
+
+    def tolane(row):
+        lanes[1::2] = row
+        return int.from_bytes(lanes, "big")
+    for y in range(h):
+        sl = slice(y * w, (y + 1) * w)
+        v = 77 * tolane(r[sl]) + 150 * tolane(g[sl]) + 29 * tolane(b[sl])
+        arr = array.array("H", v.to_bytes(2 * w, "big"))
+        if swap:
+            arr.byteswap()
+        out[sl] = bytes(map(lut.__getitem__, arr))
+    return bytes(out)
+
+
+def colour_coverage(chans, w, h, dpi, block=6, thr=36):
+    """Percent of interior blocks (block x block px) whose mean colour has
+    max-min channel spread > thr. Averaging over a block cancels the red/blue
+    fringes at black text edges (they alternate sides), real colour survives."""
+    import array, sys
+    m = dpi // 4
+    x0, x1 = m, w - m - (w - 2 * m) % block
+    if x1 - x0 < block or h - 2 * m < block:
+        return 0.0
+    nb = (x1 - x0) // block
+    swap = sys.byteorder == "little"
+    lanes = bytearray(2 * (x1 - x0))
+    area = block * block
+    hits = total = 0
+    for by in range(m, h - m - block + 1, block):
+        means = []
+        for c in chans:
+            acc = 0
+            for y in range(by, by + block):
+                lanes[1::2] = c[y * w + x0:y * w + x1]
+                acc += int.from_bytes(lanes, "big")      # 16-bit lanes: <= 6*255
+            a = array.array("H", acc.to_bytes(len(lanes), "big"))
+            if swap:
+                a.byteswap()
+            means.append([sum(a[i:i + block]) for i in range(0, len(a), block)])
+        for rs, gs, bs in zip(*means):
+            hi = rs if rs > gs else gs
+            hi = bs if bs > hi else hi
+            lo = rs if rs < gs else gs
+            lo = bs if bs < lo else lo
+            hits += hi - lo > thr * area
+        total += nb
+    return 100.0 * hits / max(1, total)
+
+
+# ---- factory light-curve correction (vendor AdjustLightFix) ---------------------
+# Scanner memory 0x10080000 (0x80000 bytes) holds per-pixel factory curves:
+# header <u32 timestamp, u32 0, u32 count>, then records of
+# <u16 hdrlen, u16 side, u16 planes, u16 bits, u32 divisor, u32 width,
+#  u32 plane_bytes, u32 data_bytes, u16 dpi, u16 per_plane, u32 flags,
+#  u8 dropout, u8 emphasis> + data (little-endian). The vendor replaces the
+# white reference with black + max(0, white - black) * curve[x] / divisor.
+LIGHTCURVE_ADDR, LIGHTCURVE_SIZE = 0x10080000, 0x80000
+
+
+def parse_light_curves(buf):
+    """-> {(side, planes, dpi): (divisor, [plane][x])} for the plain records
+    (no colour dropout / emphasis, flags bit0 set). {} if no data."""
+    if len(buf) < 12 or buf[:4] == b"\xff\xff\xff\xff":
+        return {}
+    _, _, count = struct.unpack_from("<III", buf, 0)
+    off, out = 12, {}
+    for _ in range(count):
+        if off + 32 > len(buf):
+            break
+        hl, side, planes, bits, div, w, pbytes, size, dpi, per_plane, flags = \
+            struct.unpack_from("<HHHHIIIIHHI", buf, off)
+        if hl == 0:
+            break
+        dropout = buf[off + 32] if hl > 32 else 0
+        emphasis = buf[off + 33] if hl > 33 else 0
+        data = buf[off + hl:off + hl + size]
+        off += hl + size
+        if bits != 16 or dropout or emphasis or not flags & 1 or not div:
+            continue
+        vals = struct.unpack("<%dH" % (len(data) // 2), data)
+        stride = pbytes // 2
+        curve = [list(vals[p * stride:p * stride + w]) for p in range(planes)] if per_plane \
+            else [list(vals[:w])] * planes
+        out[(side, planes, dpi)] = (div, curve)
+    return out
+
+
+def load_light_curves(r, serial, log):
+    """Factory curves, cached per scanner; re-read when the timestamp changes."""
+    path = os.path.join(CAL_CACHE_DIR, "%s-lightcurve.bin" % serial)
+    stamp = r.read_buffer(LIGHTCURVE_ADDR, 0x200)[:4]
+    try:
+        with open(path, "rb") as f:
+            buf = f.read()
+        if buf[:4] != stamp:
+            buf = None
+    except OSError:
+        buf = None
+    if buf is None:
+        log("reading factory light-curve data...")
+        buf = b"".join(r.read_buffer(LIGHTCURVE_ADDR + o, 0x10000)
+                       for o in range(0, LIGHTCURVE_SIZE, 0x10000))
+        try:
+            os.makedirs(CAL_CACHE_DIR, exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(buf)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+    return parse_light_curves(buf)
+
+
+def apply_light_curve(white, black, div, curve):
+    """Vendor CLightCurveAdjustData::AdjustData on one plane."""
+    out = list(white)
+    for x in range(min(len(white), len(curve))):
+        d = white[x] - black[x]
+        if d < 0:
+            d = 0
+        out[x] = min(0xFFFF, (d * curve[x] + (div >> 1)) // div + black[x])
+    return out
 
 
 CAL_CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "canon_r10")
@@ -726,7 +1014,7 @@ def cmd_scan(r, a):
     log("document ready status: %02x" % ready)
     if not ready and not a.no_paper_check:
         raise ScannerError("no paper in the feeder")
-    color = a.mode == "color"
+    color = a.mode in ("color", "auto")
     comp = 5 if color else 2
     if a.color_shift is None:
         a.color_shift = [1 / 3, -1 / 3] if a.dpi == 300 else [0.25, -0.25]
@@ -746,6 +1034,11 @@ def cmd_scan(r, a):
         cal = Calibrator(r, caps["width_1200"], a.dpi, color, cal_sides,
                          0 if cal_sides == 1 else 2, log if a.verbose else (lambda m: None))
         key = "%s-%s-%d-%d" % (scanner_serial(r), "color" if color else "gray", a.dpi, cal_sides)
+        if not a.no_light_curve:
+            try:
+                cal.curves = load_light_curves(r, scanner_serial(r), log)
+            except ScannerError as e:
+                log("factory light curve unavailable (%s)" % e)
         cached = None if a.recalibrate else load_calibration(key, a.cal_max_age)
         if cached:
             log("using cached calibration %s (%.0fs old)" % (key, time.time() - cached["time"]))
@@ -795,12 +1088,26 @@ def cmd_scan(r, a):
                     pinfo = {"paper_length": 0}
                 if a.verbose:
                     log("  page info %s" % pinfo)
-                plen = pinfo["paper_length"] * a.dpi // 1200
+                too_long = pinfo["paper_length"] < 0     # no trailing edge seen
+                if too_long:
+                    log("warning: sheet %d is longer than the scanner's maximum length "
+                        "(%.1f in); only the first part was scanned and the rest is "
+                        "probably still in the scanner" % (page, caps["max_length"] / caps["base_yres"]))
+                plen = max(0, pinfo["paper_length"]) * a.dpi // 1200
                 sides = process_sides(data, w, ids, 3 if color else 1, luts, a, log, plen)
                 order = sorted(sides, key=lambda t: a.order.index(t[0])) if len(sides) > 1 else sides
                 for label, iw, ih, ch, img in order:
                     sink.add(page, label, iw, ih, ch, img, log)
                 page += 1
+                if too_long:
+                    # the R10 stops the motor and latches a jam (3/80 00); report it
+                    r.read(5, 1, check=False)
+                    if r.t.status:
+                        key, asc, ascq = r.t.sense()[:3]
+                    msg, adv = describe_sense(key, asc, ascq)
+                    log("stopping: %s (sense %x/%02x %02x) - %s" % (msg, key, asc, ascq, adv)
+                        if msg else "stopping after the over-long sheet")
+                    break
             if key == 3 and asc == 0x3A:
                 break                                    # feeder empty
             if key not in (0, 1):
@@ -935,10 +1242,24 @@ def process_sides(data, w, ids, planes, luts, a, log, paper_len=0):
         iw, ih = w, h
         if not a.no_align:
             chans, iw, ih = align_page(chans, w, h, log, "A" if wid == 0 else "B", paper_len, a.dpi)
+        label = "A" if wid == 0 else "B"
+        if a.skip_blank:
+            dark = dark_coverage(chans[1] if planes == 3 else chans[0], iw, ih, a.dpi)
+            if dark < a.blank_threshold:
+                log("side %s: blank (ink %.4f%% < %.4f%%) - skipped" % (label, dark, a.blank_threshold))
+                continue
+            log("side %s: not blank (ink %.3f%%)" % (label, dark))
         if not a.no_enhance:
             chans = enhance(chans, iw, ih, a)
+        if a.mode == "auto":
+            cov = colour_coverage(chans, iw, ih, a.dpi)
+            if cov < a.colour_threshold:
+                log("side %s: no colour (%.3f%% < %.2f%%) - saved as gray" % (label, cov, a.colour_threshold))
+                result.append((label, iw, ih, 1, to_luma(chans, iw, ih)))
+                continue
+            log("side %s: colour (%.3f%%)" % (label, cov))
         if a.mode == "bw":
-            result.append(("A" if wid == 0 else "B", iw, ih, 0, to_bilevel(chans[0], iw, ih, a.threshold)))
+            result.append(("A" if wid == 0 else "B", iw, ih, 0, to_bilevel(chans[0], iw, ih, a.threshold, not a.no_despeckle)))
             continue
         if planes == 1:
             out = chans[0]
@@ -1067,11 +1388,12 @@ def shear_cols(img, w, h, s, fill=255):
 
 
 def _inset(g, w, h, pos, axis, direction, span, limit=40):
-    """(limit is in pixels; callers scale it with dpi)"""
-    """Walk from an edge line into the paper until the shadow gradient is gone.
-    axis 'x': pos is a column, mean taken over rows in span; 'y' likewise."""
+    """Walk from an edge line into the paper until the shadow gradient is gone:
+    the band mean reaches white, or stops changing (dark or coloured paper
+    never reaches white). axis 'x': pos is a column, mean over rows in span."""
     lo, hi = span
     idx = range(lo, hi, 7)
+    prev = None
     for k in range(1, limit):
         p = pos + direction * k
         if axis == "x":
@@ -1084,17 +1406,22 @@ def _inset(g, w, h, pos, axis, direction, span, limit=40):
             m = sum(g[p * w + x] for x in idx) / max(1, len(idx))
         if m >= 250:
             return k + 1
+        if prev is not None and k >= 3 and abs(m - prev) < 1.5:
+            return k
+        prev = m
     return limit
-
 
 def estimate_skew(g, w, h, max_deg=5.0, dpi=300):
     """Content-based skew (projection profile): the angle at which the dark
     pixels' row histogram is sharpest. Returns s = dx/dy of vertical lines, or
     None when the page has too little content."""
-    mask = bytes(1 if v < 128 else 0 for v in range(256))
-    pts = []
     sx = sy = max(3, 3 * dpi // 300)
     mg = dpi // 3
+    # "ink" is dark on light pages and light on dark pages (white-on-black print)
+    body = g[mg * w:(h - mg) * w:97]
+    dark = sum(1 for v in body if v < 128) > len(body) // 2
+    mask = bytes(1 if (v > 160 if dark else v < 128) else 0 for v in range(256))
+    pts = []
     for y in range(mg, h - mg, sy):
         row = g[y * w + mg:(y + 1) * w - mg:sx].translate(mask)
         i = row.find(1)
@@ -1106,17 +1433,51 @@ def estimate_skew(g, w, h, max_deg=5.0, dpi=300):
     if len(pts) > 40000:                         # keep it quick on dense pages
         pts = pts[::len(pts) // 40000 + 1]
 
-    def score(deg):
+    def score(deg, vertical):
+        # horizontal text: bins of y + x*t; sideways text: bins of x - y*t.
+        # Both give s = t (dx/dy of the page's vertical lines).
         t = math.tan(math.radians(deg))
         hist = {}
-        for x, y in pts:
-            k = int(y + x * t) // sy
-            hist[k] = hist.get(k, 0) + 1
+        if vertical:
+            for x, y in pts:
+                k = int(x - y * t) // sx
+                hist[k] = hist.get(k, 0) + 1
+        else:
+            for x, y in pts:
+                k = int(y + x * t) // sy
+                hist[k] = hist.get(k, 0) + 1
         return sum(c * c for c in hist.values())
 
-    best = max((score(d / 4), d / 4) for d in range(int(-max_deg * 4), int(max_deg * 4) + 1))[1]
-    best = max((score(best + d / 40), best + d / 40) for d in range(-10, 11))[1]
+    coarse = [d / 4 for d in range(int(-max_deg * 4), int(max_deg * 4) + 1)]
+    picks = []
+    for vertical in (False, True):
+        sc = [(score(d, vertical), d) for d in coarse]
+        top_score, best = max(sc)
+        gain = top_score / (sum(v for v, _ in sc) / len(sc))   # how sharp the best angle is
+        picks.append((gain, best, vertical))
+    gain, best, vertical = max(picks)
+    best = max((score(best + d / 40, vertical), best + d / 40) for d in range(-10, 11))[1]
     return math.tan(math.radians(best))
+
+
+def geometry_gray(g, w, h):
+    """Copy of the page for edge finding. With the factory light curve the
+    scanner backing reads ~210 (paper ~232) instead of clipping at 255; scale
+    so the backing clips again, which is what the shadow detector expects.
+    The backing level is the darker of the top/bottom strip medians (the
+    overscan above/below the paper)."""
+    import statistics
+    x0, x1 = w // 4, 3 * w // 4
+    meds = []
+    for rows in (range(0, min(24, h)), range(max(0, h - 12), h)):
+        vals = [v for y in rows for v in g[y * w + x0:y * w + x1:5]]
+        if vals:
+            meds.append(statistics.median(vals))
+    b = min(meds) if meds else 255
+    if b >= 250 or b < 120:
+        return g
+    k = 262.0 / b
+    return g.translate(bytes(min(255, int(v * k)) for v in range(256)))
 
 
 def align_page(chans, w, h, log, label, paper_len=0, dpi=300):
@@ -1125,7 +1486,7 @@ def align_page(chans, w, h, log, label, paper_len=0, dpi=300):
     s = estimate_skew(g, w, h, dpi=dpi)
     how = "text"
     if s is None:                                # blank-ish page: use the edge shadows
-        lines = find_paper_lines(g, w, h, dpi)
+        lines = find_paper_lines(geometry_gray(g, w, h), w, h, dpi)
         cands = [(len(lines[k][2]) / (h / 8), lines[k][1]) for k in ("left", "right") if lines[k]]
         cands += [(len(lines[k][2]) / (w / 8), -lines[k][1]) for k in ("top", "bottom") if lines[k]]
         s = max(cands)[1] if cands else 0.0
@@ -1134,6 +1495,7 @@ def align_page(chans, w, h, log, label, paper_len=0, dpi=300):
     if abs(s) * max(w, h) >= 1.0:
         chans = [shear_cols(shear_rows(c, w, h, s), w, h, s) for c in chans]
         g = chans[1] if len(chans) == 3 else chans[0]
+    g = geometry_gray(g, w, h)
     lines = find_paper_lines(g, w, h, dpi)
     lim = int(40 * dpi / 300)
     found = [k for k in lines if lines[k]]
@@ -1142,31 +1504,47 @@ def align_page(chans, w, h, log, label, paper_len=0, dpi=300):
            for k in ("top", "bottom") if lines[k]]
     x0, x1, y0, y1 = 0, w, 0, h
     vspan = (int(h * 0.1), int(h * 0.9))
+    at = lambda ln, u: ln[0] + ln[1] * u          # line position at u
+    # Use each edge's outermost point over the page so a slightly non-square
+    # sheet (hand-folded, trimmed) is not clipped at one end.
     if lines["left"]:
-        lx = int(round(lines["left"][0]))
+        lx = int(round(min(at(lines["left"], u) for u in vspan)))
         x0 = lx + _inset(g, w, h, lx, "x", 1, vspan, lim)
     elif ext:
         x0 = min(e[0] for e in ext) + 4
     if lines["right"]:
-        rx = int(round(lines["right"][0]))
+        rx = int(round(max(at(lines["right"], u) for u in vspan)))
         x1 = rx - _inset(g, w, h, rx, "x", -1, vspan, lim) + 1
     elif ext:
         x1 = max(e[1] for e in ext) - 4
     hspan = (max(0, x0), min(w, x1))
-    # Vertical: the scanner reports the measured paper length. Anchor on the
-    # edge whose shadow is reliably visible (side A: top, side B: bottom; the
-    # other edge casts none) and put the opposite edge one paper length away.
-    top = int(round(lines["top"][0])) if lines["top"] else None
-    bot = int(round(lines["bottom"][0])) if lines["bottom"] else None
+    ends = (hspan[0], hspan[1] - 1)
+    # Vertical: the scanner reports the measured paper length. Edges whose
+    # shadow is invisible (white paper: side A bottom, side B top) are placed
+    # one paper length from the visible one; a detected opposite edge is kept
+    # when it agrees with the measured length to 0.15".
+    top_ln, bot_ln = lines["top"], lines["bottom"]
+    top = int(round(min(at(top_ln, u) for u in ends))) if top_ln else None
+    bot = int(round(max(at(bot_ln, u) for u in ends))) if bot_ln else None
     if paper_len > h // 3:
-        if label == "A" or bot is None:
-            bot = top + paper_len if top is not None else None
+        tol = 0.15 * dpi
+        if top is not None and bot is not None:
+            span_lo = min(at(bot_ln, u) - at(top_ln, u) for u in ends)
+            span_hi = max(at(bot_ln, u) - at(top_ln, u) for u in ends)
+            agree = span_lo - tol <= paper_len <= span_hi + tol
         else:
-            top = bot - paper_len
+            agree = False
+        if not agree:
+            if label == "A" or bot is None:
+                bot = top + paper_len if top is not None else None
+            else:
+                top = bot - paper_len
     if top is not None:
         y0 = clamp(top + _inset(g, w, h, top, "y", 1, hspan, lim), 0, h)
     if bot is not None:
         y1 = clamp(bot - _inset(g, w, h, bot, "y", -1, hspan, lim) + 1, 0, h) if 0 <= bot < h else min(h, bot)
+    t = max(1, dpi // 100)                       # 0.01" safety trim for corner shadow remnants
+    x0, x1, y0, y1 = min(x0 + t, w), max(x1 - t, 0), min(y0 + t, h), max(y1 - t, 0)
     if x1 - x0 < w // 3 or y1 - y0 < h // 3:
         x0, x1, y0, y1 = 0, w, 0, h
     nw, nh = x1 - x0, y1 - y0
@@ -1316,8 +1694,18 @@ def main():
     p.add_argument("-o", "--out", default="scans",
                    help="directory for PNGs, or a file name ending in .pdf")
     p.add_argument("--dpi", type=int, default=300)
-    p.add_argument("--mode", choices=["gray", "color", "bw"], default="gray",
-                   help="bw = black-and-white text mode (gray scan, 1-bit output)")
+    p.add_argument("--mode", choices=["gray", "color", "bw", "auto"], default="gray",
+                   help="bw = black-and-white text mode (gray scan, 1-bit output); "
+                        "auto = scan in colour, save pages without colour as gray")
+    p.add_argument("--colour-threshold", type=float, default=0.25, metavar="PCT",
+                   help="auto mode: percent of the page (6x6 px blocks) that must be "
+                        "coloured to keep it in colour (default 0.25)")
+    p.add_argument("--skip-blank", action="store_true", help="drop blank sides")
+    p.add_argument("--blank-threshold", type=float, default=0.005, metavar="PCT",
+                   help="--skip-blank: a side with less than this percent of ink-dark "
+                        "pixels is blank (default 0.005)")
+    p.add_argument("--no-despeckle", action="store_true",
+                   help="bw mode: keep isolated single black pixels")
     p.add_argument("--threshold", type=int, default=170,
                    help="bw mode: gray level (after enhancement) at or above which a pixel is white")
     p.add_argument("--duplex", action="store_true", help="scan both sides")
@@ -1330,11 +1718,16 @@ def main():
                    help="seconds to wait for the next hand-fed sheet (default: until the "
                         "scanner button or Ctrl-C ends the batch; 0 = stop when empty)")
     p.add_argument("--no-align", action="store_true", help="no deskew / crop to paper")
+    p.add_argument("--no-light-curve", action="store_true",
+                   help="skip the factory light-curve correction of the white reference")
     p.add_argument("--no-enhance", action="store_true", help="no levels / sharpening (raw shaded output)")
+    p.add_argument("--chroma-denoise", type=int, default=2, metavar="R",
+                   help="colour: smooth colour noise over a (2R+1)^2 box (0 = off, default 2)")
     p.add_argument("--sharpen", type=float, default=None,
                    help="unsharp-mask amount (0 = off; default 0.75 at 300 dpi, 0.4 at 600 dpi)")
     p.add_argument("--black-point", type=int, default=None, help="input level mapped to black (default: auto)")
-    p.add_argument("--white-point", type=int, default=240, help="input level mapped to white (default 240)")
+    p.add_argument("--white-point", type=int, default=None,
+                   help="input level mapped to white (default: auto from the paper level)")
     p.add_argument("--gamma", type=float, default=1.0, help="levels gamma (>1 darkens mid-tones)")
     p.add_argument("--order", default="BA",
                    help="duplex side order in the output (default BA: side B is the face-up side)")

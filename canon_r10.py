@@ -354,8 +354,16 @@ class R10:
         cdb = bytes([0x28, 0, dtc[dtc_index], 0]) + q[dtc_index] + struct.pack(">I", length)[1:] + b"\0"
         return self.t.execute(cdb, data_in_len=length, check=check)
 
-    def document_ready(self):
+    def ready_bits(self):
+        """READ dtc 8B: bit 0 = sheet in the paper feeder, bit 3 = card at the
+        front card slot (IR sensor; the vendor driver tests (v & 9) == 8)."""
         return self.read(5, 1)[0]
+
+    def document_ready(self):
+        return self.ready_bits() & 0x01
+
+    def card_present(self):
+        return (self.ready_bits() & 0x09) == 0x08
 
     def button_down(self):
         """Operation-panel key state (vendor "OperationpanelEZKeyStatus"):
@@ -1076,6 +1084,8 @@ def cmd_scan(r, a):
     log("caps: %s" % {k: v for k, v in caps.items() if k != "raw"})
     if a.dpi not in (300, 600):
         raise ScannerError("the R10 scans at 300 or 600 dpi")
+    if a.card:                                 # the card wait comes after calibration
+        a.duplex, a.button, a.wait_paper = True, False, False
     if a.button:
         log("load a sheet and press the scanner button (Ctrl-C to cancel)...")
         while True:
@@ -1093,9 +1103,11 @@ def cmd_scan(r, a):
             if r.document_ready():                    # still there: start
                 break
             log("paper not detected any more - still waiting...")
-    ready = r.document_ready()
+    ready = r.ready_bits()
     log("document ready status: %02x" % ready)
-    if not ready and not a.no_paper_check:
+    if a.card:
+        ready = 1
+    if not ready & 1 and not a.no_paper_check:
         raise ScannerError("no paper in the feeder")
     color = a.mode in ("color", "auto")
     comp = 5 if color else 2
@@ -1149,7 +1161,9 @@ def cmd_scan(r, a):
         for wid in (0, 1):
             r.set_window(wid, a.dpi, a.dpi, 0, uly & 0xFFFFFFFF, caps["width_1200"], length, comp)
         r.define_scan_mode(0x30, b"")                    # double-feed detection off
-        r.define_scan_mode(0x32, bytes([side, 1]))       # side mode, buffering
+        # side mode; card: flags byte (page byte 6) 0x20|0x08 as the vendor
+        # driver sends when the card sensor is set (and buffering 0x40 off)
+        r.define_scan_mode(0x32, bytes([side, 1, 0, 0, 0x28]) if a.card else bytes([side, 1]))
         r.define_scan_mode(0x36, b"")                    # no colour dropout
         r.scan(ids)
 
@@ -1167,14 +1181,21 @@ def cmd_scan(r, a):
                         log("no paper after %d attempts - finishing" % attempts)
                         return False
                     raise
-                log("no paper at scan start (attempt %d of %d) - waiting for the sheet..."
-                    % (n, attempts))
-                if wait_for_sheet(r, timeout=30) != "paper":
+                log("no %s at scan start (attempt %d of %d) - waiting for it..."
+                    % ("card" if a.card else "paper", n, attempts))
+                if (wait_for_card(r, log, timeout=30) != "card" if a.card
+                        else wait_for_sheet(r, timeout=30) != "paper"):
                     log("no sheet - finishing")
                     return False
         return False
 
     log("side mode %d, window ids %s" % (side, ids))
+    if a.card:
+        log("card mode: push a card into the front card slot (scanner button or "
+            "Ctrl-C cancels)...")
+        if wait_for_card(r, log) != "card":
+            log("cancelled - nothing scanned")
+            return
     if not start_scan_retry():
         return
 
@@ -1230,7 +1251,12 @@ def cmd_scan(r, a):
                 break
             if not data or a.single:
                 break
-            if not next_page(r, a.feed_timeout, log, a.verbose, a.button):
+            if a.card:
+                log("card done - push in the next card, or press the scanner button "
+                    "to finish...")
+                if wait_for_card(r, log) != "card":
+                    break
+            elif not next_page(r, a.feed_timeout, log, a.verbose, a.button):
                 break
             if not start_scan_retry():                   # the R10 needs a SCAN per sheet
                 break
@@ -1260,6 +1286,41 @@ def wait_for_sheet(r, timeout=-1, settle=0.8, poll=0.08):
                         return "paper"
                 else:
                     since = None
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        return "interrupt"
+    return "timeout"
+
+
+def wait_for_card(r, log, timeout=-1, settle=0.8, poll=0.08):
+    """Wait for a card to be pushed into the front card slot. A card that was
+    just scanned rests in the slot and still sets the sensor; scanning it again
+    jams (3/80 00), so require the slot to read empty first, then a card that
+    stays for `settle` s. -> "card", "button", "timeout" or "interrupt"."""
+    t0 = time.time()
+    empty_seen = False
+    since = None
+    told = False
+    n = 0
+    try:
+        while timeout < 0 or time.time() - t0 < timeout:
+            if r.button_down():
+                while r.button_down():
+                    time.sleep(poll)
+                return "button"
+            n += 1
+            if n % 3 == 0:
+                card = r.card_present()
+                if not card:
+                    empty_seen, since = True, None
+                elif not empty_seen:
+                    if not told:
+                        log("remove the card from the slot, then push it (or the next one) in")
+                        told = True
+                else:
+                    since = since or time.time()
+                    if time.time() - since >= settle:
+                        return "card"
             time.sleep(poll)
     except KeyboardInterrupt:
         return "interrupt"
@@ -1412,7 +1473,13 @@ def process_sides(data, w, ids, planes, luts, a, log, paper_len=0, vbin=1):
                 img = img[::-1] if wid == 1 else flip_vertical(img, w, ph)
             chans.append(img)
         iw, ih = w, ph
-        if not a.no_align:
+        if getattr(a, "card", False):
+            if not a.no_align:
+                chans, iw, ih = crop_card(chans, w, ph, log, "A" if wid == 0 else "B", a.dpi)
+            if a.card_rotate:
+                rot = [rotate_image(c, iw, ih, a.card_rotate) for c in chans]
+                chans, iw, ih = [x[0] for x in rot], rot[0][1], rot[0][2]
+        elif not a.no_align:
             chans, iw, ih = align_page(chans, w, ph, log, "A" if wid == 0 else "B", paper_len, a.dpi)
         label = "A" if wid == 0 else "B"
         if a.skip_blank:
@@ -1525,6 +1592,110 @@ def find_paper_lines(g, w, h, dpi=300):
         "top": ransac_line(pts["top"], nh, 0.35, tol, min_sep=w // 4),
         "bottom": ransac_line(pts["bottom"], nh, 0.35, tol, min_sep=w // 4),
     }
+
+
+def _card_edges(g, w, h, colbk, dpi=300, tol=16, run=8, step=2):
+    """Per sampled row: (y, leftmost x, rightmost x) of a run of `run` pixels
+    that differ from the backing (per-column backing level colbk) by > tol.
+    While a card passes, the strip between the card and the near edge of the
+    scan area reads ~25 darker than the empty backing, so a run that starts at
+    the image border is moved to the sharpest step (the card's edge) inside it."""
+    out = []
+    key = b"\1" * run
+    d = 3
+    for y in range(0, h, step):
+        row = g[y * w:(y + 1) * w]
+        diff = bytes(1 if abs(v - b) > tol else 0 for v, b in zip(row, colbk))
+        x0 = diff.find(key)
+        if x0 < 0:
+            continue
+        x1 = diff.rfind(key) + run - 1
+        if x0 <= 4 and x1 - x0 > dpi:
+            lim = x1 - dpi                     # card is at least ~2" wide
+            st = max((abs(row[x + d] - row[x - d]), x) for x in range(d, lim))
+            if st[0] > 30:
+                x0 = st[1]
+        if x1 >= w - 5 and x1 - x0 > dpi:
+            lim = x0 + dpi
+            st = max((abs(row[x + d] - row[x - d]), x) for x in range(lim, w - d))
+            if st[0] > 30:
+                x1 = st[1]
+        out.append((y, x0, x1))
+    return out
+
+
+def _column_backing(g, w, h):
+    """Backing level per column from the overscan strips above and below the card."""
+    import statistics
+    top = range(0, min(24, h))
+    bot = range(max(0, h - 12), h)
+    return [int(statistics.median([g[y * w + x] for y in top] + [g[y * w + x] for y in bot]))
+            for x in range(w)]
+
+
+def _fit(points):
+    """Least-squares x = a + s*y over (y, x) pairs -> (a, s)."""
+    n = len(points)
+    my = sum(p[0] for p in points) / n
+    mx = sum(p[1] for p in points) / n
+    syy = sum((p[0] - my) ** 2 for p in points) or 1.0
+    s = sum((p[0] - my) * (p[1] - mx) for p in points) / syy
+    return mx - s * my, s
+
+
+def crop_card(chans, w, h, log, label, dpi=300):
+    """Deskew and crop to a card: find the card against the backing (cards can
+    be darker or brighter than the backing, so use |pixel - backing|), take the
+    slant of its long side edges, straighten, and crop to its box."""
+    g = chans[1] if len(chans) == 3 else chans[0]
+    colbk = _column_backing(g, w, h)
+    rows = _card_edges(g, w, h, colbk, dpi)
+    if len(rows) < dpi // 4:
+        log("side %s: no card found - not cropped" % label)
+        return chans, w, h
+    lo, hi = rows[0][0], rows[-1][0]
+    mid = [r for r in rows if lo + (hi - lo) * 0.2 <= r[0] <= lo + (hi - lo) * 0.8]
+    _, sl = _fit([(y, x0) for y, x0, _ in mid])
+    _, sr = _fit([(y, x1) for y, _, x1 in mid])
+    s = (sl + sr) / 2 if abs(sl - sr) < 0.02 else min(sl, sr, key=abs)
+    if abs(s) * h >= 1.0:
+        fills = [int(sorted(c[:24 * w:7])[len(c[:24 * w:7]) // 2]) for c in chans]
+        chans = [shear_cols(shear_rows(c, w, h, s, f), w, h, s, f) for c, f in zip(chans, fills)]
+        g = chans[1] if len(chans) == 3 else chans[0]
+        rows = _card_edges(g, w, h, colbk, dpi)
+        lo, hi = rows[0][0], rows[-1][0]
+        mid = [r for r in rows if lo + (hi - lo) * 0.2 <= r[0] <= lo + (hi - lo) * 0.8]
+    xs0 = sorted(r[1] for r in mid)
+    xs1 = sorted(r[2] for r in mid)
+    x0 = xs0[len(xs0) // 2] + 1
+    x1 = xs1[len(xs1) // 2] - 1
+    # top/bottom: rows where most of [x0, x1] is card
+    need = (x1 - x0) // 2
+    ys = []
+    for y in range(h):
+        row = g[y * w + x0:y * w + x1]
+        if sum(1 for v, b in zip(row, colbk[x0:x1]) if abs(v - b) > 16) > need:
+            ys.append(y)
+    if not ys or x1 <= x0:
+        log("side %s: card edges unclear - not cropped" % label)
+        return chans, w, h
+    y0, y1 = ys[0] + 1, ys[-1] - 1
+    nw, nh = x1 - x0 + 1, y1 - y0 + 1
+    chans = [b"".join(c[y * w + x0:y * w + x1 + 1] for y in range(y0, y1 + 1)) for c in chans]
+    log("side %s: card skew %.2f deg, crop x %d..%d y %d..%d -> %dx%d (%.2fx%.2f in)"
+        % (label, math.degrees(math.atan(s)), x0, x1, y0, y1, nw, nh, nw / dpi, nh / dpi))
+    return chans, nw, nh
+
+
+def rotate_image(c, w, h, deg):
+    """Rotate one channel by 90/180/270 degrees clockwise."""
+    if deg == 180:
+        return c[::-1], w, h
+    if deg == 90:                                   # new row x = column x, bottom to top
+        return b"".join(c[x::w][::-1] for x in range(w)), h, w
+    if deg == 270:
+        return b"".join(c[x::w] for x in range(w - 1, -1, -1)), h, w
+    return c, w, h
 
 
 def shear_rows(img, w, h, s, fill=255):
@@ -2008,6 +2179,7 @@ def main():
         epilog="""quick start:
   canon_r10.py --default-col     colour, 300 dpi, both sides, PDF; feed sheets, button to finish
   canon_r10.py --default-bw      the same in black and white
+  canon_r10.py --default-card    ID/bank cards via the front card slot (colour, both sides)
   canon_r10.py scan --help       all scan options, presets and recommended settings
   canon_r10.py max-length 1000   long document mode (sheets up to 1 m)""")
     ap.add_argument("--volume", help="mount point of ONTOUCHLITE (auto)")
@@ -2038,6 +2210,11 @@ def main():
         Waits for the first sheet (button/Ctrl-C cancels), scans each sheet as it
         is fed, and finishes when the scanner button is pressed (Ctrl-C also saves).
         Blank sides are skipped (--keep-blank to keep them).
+  --default-card  ID/bank cards: colour, 300 dpi, both sides, cropped to the card.
+        Push each card into the front card slot (the clear flap, front right);
+        the scanner pulls it in, scans it and pushes it back out. Take it out
+        before pushing in the next card. Button or Ctrl-C finishes and saves.
+        Cards come out as scanned (portrait); --card-rotate 90 (or 270) turns them.
   Mode, dpi and duplex are fixed by the preset; other options still apply.
 
 output (-o):
@@ -2065,6 +2242,13 @@ recommended image settings (on by default for every scan, presets included):
                    help="preset for colour documents (see 'presets' below)")
     p.add_argument("--default-bw", action="store_true",
                    help="preset for black-and-white text documents (see 'presets' below)")
+    p.add_argument("--default-card", action="store_true",
+                   help="preset for ID/bank cards (see 'presets' below)")
+    p.add_argument("--card", action="store_true",
+                   help="card mode: scan cards pushed into the front card slot (both sides, "
+                        "one card at a time; button or Ctrl-C finishes)")
+    p.add_argument("--card-rotate", type=int, choices=[0, 90, 180, 270], default=0,
+                   help="card mode: rotate each side clockwise by this many degrees")
     p.add_argument("--keep-blank", action="store_true",
                    help="presets: keep blank sides (blank-page skipping is on by default)")
     p.add_argument("--wait-paper", action="store_true",
@@ -2124,16 +2308,18 @@ recommended image settings (on by default for every scan, presets included):
     p.add_argument("--no-normalize", action="store_true", help="(uncalibrated only) skip software levels")
     p.add_argument("--no-flip", action="store_true", help="keep raw line order")
     argv = sys.argv[1:]
-    if any(x in ("--default-col", "--default-bw") for x in argv) and "scan" not in argv:
+    if any(x in ("--default-col", "--default-bw", "--default-card") for x in argv) and "scan" not in argv:
         argv = ["scan"] + argv                    # allow: canon_r10.py --default-col
     a = ap.parse_args(argv)
     if a.cmd == "scan":
-        if a.default_col and a.default_bw:
-            ap.error("--default-col and --default-bw are mutually exclusive")
-        if a.default_col or a.default_bw:
-            a.mode = "color" if a.default_col else "bw"
+        if a.default_col + a.default_bw + a.default_card > 1:
+            ap.error("--default-col, --default-bw and --default-card are mutually exclusive")
+        if a.default_card:
+            a.card = True
+        if a.default_col or a.default_bw or a.default_card:
+            a.mode = "color" if (a.default_col or a.default_card) else "bw"
             a.dpi, a.duplex, a.wait_paper, a.single, a.button = a.dpi, True, True, False, False
-            a.skip_blank = not a.keep_blank
+            a.skip_blank = not a.keep_blank and not a.card      # a plain card back is kept
             stamp = time.strftime("scan-%Y%m%d-%H%M%S.pdf")
             if a.out is None:
                 a.out = stamp

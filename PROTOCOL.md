@@ -83,6 +83,27 @@ State machine (8 lines averaged to one line, values 0–4095):
 Then a white reference (ids FE) and a dark reference (ids FF) build the shading:
 `coef = (T<<12)/(white−black)` (T = 4316 gray; 4306/4317/4349 R/G/B), `out = clamp((pix − black>>4)·coef >> 12)`.
 
+## Card scanning (front card slot) — verified live
+Cards go into the front card slot: the clear flap on the right of the paper exit. The scanner pulls the card in slightly and holds it.
+After a SCAN it pulls the card through, scans both sides and pushes it back out of the same slot. Paper goes in at the top.
+- **Detection:** READ dtc 8B (document ready). Bit 0 = sheet in the paper feeder (paper sensor). Bit 3 = card in the card slot (IR sensor).
+  The vendor driver treats `(v & 9) == 8` as card mode. A card in the slot never sets bit 0, and a card in the paper feeder is not seen at all.
+- **Scan mode for a card:** DEFINE SCAN MODE page 0x32 = side mode 2 (duplex). The flags byte (page byte 6, our body offset 4) is
+  `0x28` (0x20 | 0x08; the vendor also clears buffering 0x40). The driver swaps the front and back settings in page 0x36.
+  SET WINDOW is the same as for paper (the scanner stops at the card's trailing edge).
+  With flags 0x60 or 0x00 the scan is still accepted. Without a card at bit 3, SCAN fails with 5/3A 00.
+- **Timing:** the scanner holds the card for only a short time. SCAN ~0.8–0.9 s after bit 3 appears works. After 4+ s
+  (calibrating first) the sensor no longer reports the card and SCAN fails with 5/3A. So calibrate before waiting for the card.
+- **A card resting in the slot after being scanned still sets bit 3.** Scanning it again gives a jam (3/80 00, no data).
+  canon_r10.py therefore needs the slot to read empty, then a fresh card that stays for 0.8 s.
+- **Result:** ~1313 lines at 300 dpi (with the 0.39" lead-in), page info paper_length ≈ 4048–4076/1200" = 3.37–3.40"
+  (the card's long side: it travels long edge first, so the image is portrait, 2.2 × 3.4").
+- **Crop:** the card is found against the per-column backing level (|pixel − backing| > 16, so dark and light cards both work).
+  While a card passes, the strip between the card and the near edge of the scan area reads ~190 against 213 for the empty backing.
+  A detected area that touches the image border is therefore moved to the sharpest step (the card edge).
+  The card's slant comes from its long side edges.
+- canon_r10.py: `--default-card` (colour, both sides, PDF) or `scan --card`; `--card-rotate 90|180|270`.
+
 ## Front-sensor shear (measured)
 Images from side A (front sensor) are slightly sheared, not just rotated: text lines come out about 0.25–0.40° more tilted
 than vertical rules and column edges on the same page (three scans: +0.25/+0.30/+0.40°). Side B shows −0.02 to −0.15°.

@@ -1073,7 +1073,8 @@ def cmd_scan(r, a):
     log("side mode %d, window ids %s" % (side, ids))
     start_scan()
 
-    sink = PdfSink(a.out, a.dpi) if a.out.lower().endswith(".pdf") else PngSink(a.out)
+    sink = (PdfSink(a.out, a.dpi, a.jpeg_quality, log) if a.out.lower().endswith(".pdf")
+            else PngSink(a.out))
     page = 0
     try:
         while True:
@@ -1092,7 +1093,9 @@ def cmd_scan(r, a):
                 if too_long:
                     log("warning: sheet %d is longer than the scanner's maximum length "
                         "(%.1f in); only the first part was scanned and the rest is "
-                        "probably still in the scanner" % (page, caps["max_length"] / caps["base_yres"]))
+                        "probably still in the scanner. For long sheets use long document "
+                        "mode: canon_r10.py max-length 1000 (or 3000)"
+                        % (page, caps["max_length"] / caps["base_yres"]))
                 plen = max(0, pinfo["paper_length"]) * a.dpi // 1200
                 sides = process_sides(data, w, ids, 3 if color else 1, luts, a, log, plen)
                 order = sorted(sides, key=lambda t: a.order.index(t[0])) if len(sides) > 1 else sides
@@ -1570,11 +1573,50 @@ class PngSink:
         pass
 
 
-class PdfSink:
-    """Minimal streaming PDF writer: one Flate-compressed image per page."""
+def jpeg_encoder():
+    """-> (name, encode(w, h, ch, data, quality) -> bytes) or (None, None).
+    Pillow if importable, else the libjpeg `cjpeg` tool on PATH (fed a PPM/PGM
+    on stdin; on NixOS: nix shell nixpkgs#libjpeg_turbo)."""
+    try:
+        from PIL import Image
+        import io
 
-    def __init__(self, path, dpi):
+        def enc(w, h, ch, data, q):
+            buf = io.BytesIO()
+            Image.frombytes("RGB" if ch == 3 else "L", (w, h), data).save(
+                buf, "JPEG", quality=q, optimize=True)
+            return buf.getvalue()
+        return "Pillow", enc
+    except ImportError:
+        pass
+    import shutil
+    exe = shutil.which("cjpeg")
+    if exe:
+        import subprocess
+
+        def enc(w, h, ch, data, q):
+            hdr = b"P%d\n%d %d\n255\n" % (6 if ch == 3 else 5, w, h)
+            r = subprocess.run([exe, "-quality", str(q), "-optimize"], input=hdr + data,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            return r.stdout
+        return "cjpeg", enc
+    return None, None
+
+
+class PdfSink:
+    """Minimal streaming PDF writer: one image per page. Colour pages are
+    JPEG (DCTDecode) when an encoder is available and jpeg_quality > 0,
+    everything else Flate."""
+
+    def __init__(self, path, dpi, jpeg_quality=0, log=None):
         self.path, self.dpi = path, dpi
+        self.jpeg_quality, self.jpeg = jpeg_quality, None
+        if jpeg_quality > 0:
+            name, self.jpeg = jpeg_encoder()
+            if log:
+                log("colour pages: %s" % ("JPEG quality %d (%s)" % (jpeg_quality, name) if name else
+                    "lossless - no JPEG encoder (install Pillow, or put cjpeg on PATH: "
+                    "nix shell nixpkgs#libjpeg_turbo)"))
         self.f = open(path + ".part", "wb")
         self.offsets = []
         self.pages = []
@@ -1596,11 +1638,19 @@ class PdfSink:
     def add(self, page, label, w, h, ch, img, log):
         import zlib
         img_n, cont_n, page_n = self._reserve(), self._reserve(), self._reserve()
-        data = zlib.compress(img, 6)
+        filt, data = b"/FlateDecode", None
+        if ch == 3 and self.jpeg:
+            try:
+                data, filt = self.jpeg(w, h, ch, img, self.jpeg_quality), b"/DCTDecode"
+            except Exception as e:                      # fall back to lossless
+                log("JPEG encoding failed (%s); page stored lossless" % e)
+                data = None
+        if data is None:
+            data = zlib.compress(img, 6)
         cs = b"/DeviceRGB" if ch == 3 else b"/DeviceGray"
         self._obj(img_n, b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s "
-                  b"/BitsPerComponent %d /Filter /FlateDecode /Length %d >>"
-                  % (w, h, cs, 1 if ch == 0 else 8, len(data)), data)
+                  b"/BitsPerComponent %d /Filter %s /Length %d >>"
+                  % (w, h, cs, 1 if ch == 0 else 8, filt, len(data)), data)
         pw, ph = w * 72.0 / self.dpi, h * 72.0 / self.dpi
         content = b"q %.3f 0 0 %.3f 0 0 cm /Im0 Do Q" % (pw, ph)
         self._obj(cont_n, b"<< /Length %d >>" % len(content), content)
@@ -1628,6 +1678,34 @@ class PdfSink:
         self.f.close()
         os.replace(self.path + ".part", self.path)
         log("wrote %s (%d pages)" % (self.path, len(self.pages)))
+
+
+MAX_LENGTH_MODES = {"standard": 355600, "1000": 1000000, "3000": 3000000}   # micrometres
+
+
+def cmd_max_length(r, a):
+    """Show or set the stored maximum document length (vendor maintenance panel
+    "Maximum length for paper size": Standard 356 mm / Long Document 1,000 or
+    3,000 mm). Stored in the scanner: READ/SEND dtc 8C q 00 01 (0x80 bytes),
+    BE32 at offset 0x10 in micrometres. INQUIRY EVPD F0 max_length follows it."""
+    blk = bytearray(r.read(7, 0x80))
+    cur = struct.unpack_from(">I", blk, 0x10)[0]
+    if a.length:
+        new = MAX_LENGTH_MODES[a.length]
+        if new != cur:
+            struct.pack_into(">I", blk, 0x10, new)
+            r.t.execute(bytes([0x2A, 0, 0x8C, 0, 0, 1, 0, 0, 0x80, 0]), data_out=bytes(blk))
+            cur = struct.unpack_from(">I", r.read(7, 0x80), 0x10)[0]
+            if cur != new:
+                raise ScannerError("scanner kept %d um after setting %d um" % (cur, new))
+    name = {v: k for k, v in MAX_LENGTH_MODES.items()}.get(cur, "custom")
+    caps = r.inquiry_ex()
+    print("maximum document length: %.0f mm (%s); scanner reports %.2f in"
+          % (cur / 1000.0, name, caps["max_length"] / caps["base_yres"]))
+    if cur > 400000:
+        print("long document mode: feed long sheets straight and by hand; jam detection is "
+              "delayed (vendor warning). Pages use a lot of memory "
+              "(raw data about 30 MB per metre per side in gray at 300 dpi; x3 for colour, x4 at 600 dpi).")
 
 
 def cmd_button(r, a):
@@ -1680,6 +1758,9 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info", help="INQUIRY")
+    p = sub.add_parser("max-length", help="show/set the maximum document length (long document mode)")
+    p.add_argument("length", nargs="?", choices=sorted(MAX_LENGTH_MODES),
+                   help="standard (356 mm), 1000 or 3000 (mm, long document mode)")
     p = sub.add_parser("button", help="wait for the scanner button (for scripts)")
     p.add_argument("--loop", action="store_true", help="print a line per press until Ctrl-C")
     p.add_argument("--timeout", dest="btn_timeout", type=float, default=None,
@@ -1700,6 +1781,9 @@ def main():
     p.add_argument("--colour-threshold", type=float, default=0.25, metavar="PCT",
                    help="auto mode: percent of the page (6x6 px blocks) that must be "
                         "coloured to keep it in colour (default 0.25)")
+    p.add_argument("--jpeg-quality", type=int, default=85, metavar="Q",
+                   help="PDF: store colour pages as JPEG at this quality (1-100; 0 = lossless). "
+                        "Needs Pillow or the cjpeg tool")
     p.add_argument("--skip-blank", action="store_true", help="drop blank sides")
     p.add_argument("--blank-threshold", type=float, default=0.005, metavar="PCT",
                    help="--skip-blank: a side with less than this percent of ink-dark "
@@ -1748,7 +1832,8 @@ def main():
     try:
         with FileTransport(a.volume, a.timeout, a.verbose) as t:
             {"info": cmd_info, "appfiles": cmd_appfiles, "raw": cmd_raw,
-             "scan": cmd_scan, "button": cmd_button}[a.cmd](R10(t), a)
+             "scan": cmd_scan, "button": cmd_button,
+             "max-length": cmd_max_length}[a.cmd](R10(t), a)
     except ScannerError as e:
         sys.exit("error: %s" % e)
 

@@ -177,6 +177,25 @@ Photos and halftone logos lose detail; the vendor's error-diffusion mode is not 
   Measured: black-text page 0.000–0.001%, blank-with-show-through 0.049%, insurance-letter page with only teal headings 0.96%,
   logo page 1.6%, LEGO leaflet 3.7–33%.
 
+## Long document mode (stored setting)
+Canon's maintenance panel item "Maximum length for paper size" (Standard 356 mm, Long Document 1,000 mm / 3,000 mm) is a
+**persistent scanner setting**, not a per-scan flag (`CCanoDR::SetMaxScanLength`, `DRUIController::changeMaxScanLength:`):
+- READ `28 00 8c 00 00 01 000080 00` (0x80 bytes); the BE32 at offset 0x10 is the maximum length in **micrometres**
+  (factory value 355600 = 14.0"; the app writes 355600 / 1000000 / 3000000).
+- Write it back with SEND `2a 00 8c 00 00 01 000080 00` + the 0x80-byte block (data-out packet as usual).
+- INQUIRY EVPD F0 max_length follows immediately (8484 → 23858 @600 dpi = 39.76" for 1,000 mm), so window
+  sizing from max_length picks it up with no other changes. Verified live: a 15.65" leaflet scanned complete
+  (it previously stopped at about 14.5" with jam 3/80 00 and paper_length −1).
+- Vendor caveats: feed long sheets straight and by hand; jam detection is delayed.
+canon_r10.py: `max-length [standard|1000|3000]`. The original block of this unit is saved in `dump/dtc8c_q01_before.bin`.
+
+## PDF output (software)
+Streaming writer: one image XObject per page with the MediaBox from dpi. Gray and black-and-white pages use Flate
+(B&W is 1-bit). Colour pages use JPEG (`/DCTDecode`, `--jpeg-quality` default 85, 0 = lossless). The encoder is Pillow
+if importable, else `cjpeg` on PATH (fed a PPM on stdin; NixOS: `nix shell nixpkgs#libjpeg_turbo`), else lossless with
+a notice. Measured at q85: 600 dpi colour leaflet 93.9 → 14.3 MB; insurance-letter colour pages 9.4 → 3.4 MB (2.5 MB at q75);
+text shows no visible artefacts at 2× zoom.
+
 ## Scanner button
 Vendor status "OperationpanelEZKeyStatus" (`CCanoDR::GetStatus`): READ `28 00 84 00 00 00 000008 00`.
 Byte 0 bit 7 = the R10's button (vendor key 1; bits 6 and 2 are keys 2 and 3, unused).
@@ -215,9 +234,6 @@ feeder with READ 8B (or REQUEST SENSE after it).
 
 ## TODO
 Features
-- Long document mode: sheets over the 14.14" max_length stop with a jam (3/80 00, paper_length −1). Canon's app has a
-  "Long Document mode" (strings `LongDocumentMode Info`, `label_max_length_for_pp_size` in R10Lite.ds). Find how
-  it extends the window (larger SET WINDOW length / a DEFINE SCAN MODE flag) and whether the R10 firmware allows it.
 - Button cancels a sheet mid-scan (vendor polls the key during READ, `SetEzKeyAbort`); currently it only ends a batch between sheets.
 - Double-feed detection (DEFINE SCAN MODE page 0x30; sense 3/81 01 is already decoded).
 - Software resolutions other than 300/600, error-diffusion B&W.
